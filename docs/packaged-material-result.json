@@ -1,0 +1,161 @@
+{
+  "passed": true,
+  "packaged": true,
+  "platform": "darwin",
+  "architecture": "arm64",
+  "executedAt": "2026-10-03T18:28:38.383Z",
+  "executable": "/Users/andriishmata/Documents/GitHub/Приложение для универа/release/mac-arm64/LectureDesk.app/Contents/MacOS/LectureDesk",
+  "appAsarSha256": "2a187e6e2a87c3bb97306580863064fca6bf00bcefe636cf0d767850b8822d1c",
+  "isolatedProfile": "/var/folders/7n/q_2j3bvd6v348r15ph2j8jzh0000gn/T/lecturedesk-packaged-material-T8bjc2",
+  "workingDirectory": "/var/folders/7n/q_2j3bvd6v348r15ph2j8jzh0000gn/T/lecturedesk-packaged-material-T8bjc2",
+  "paidApiCalls": 0,
+  "checks": [
+    "Packaged app launched with cwd and profile outside the repository",
+    "Packaged PDF worker extracted multilingual text with page provenance",
+    "Packaged PDF rasterizer and offline Tesseract OCR processed two scanned pages",
+    "Packaged image OCR loaded English/Russian/Ukrainian/Polish resources without repository fallback",
+    "Packaged DOCX and TXT import preserved multilingual text",
+    "Packaged TXT/Markdown/DOCX/PDF exports opened and round-tripped every multilingual phrase",
+    "No API key, no attempted OpenAI calls, no renderer/module/worker errors"
+  ],
+  "rendererErrors": [],
+  "applicationErrors": [],
+  "packageState": {
+    "isPackaged": true,
+    "resourcesPath": "/Users/andriishmata/Documents/GitHub/Приложение для универа/release/mac-arm64/LectureDesk.app/Contents/Resources",
+    "cwd": "/private/var/folders/7n/q_2j3bvd6v348r15ph2j8jzh0000gn/T/lecturedesk-packaged-material-T8bjc2",
+    "appVersion": "0.1.0"
+  },
+  "exports": [
+    {
+      "format": "txt",
+      "path": "/var/folders/7n/q_2j3bvd6v348r15ph2j8jzh0000gn/T/lecturedesk-packaged-material-T8bjc2/exported-multilingual.txt",
+      "size": 130,
+      "sha256": "1a77369cefe30c2d83ef179210ffa17229f9497a6b9cb4b36699c2f040f19e5b"
+    },
+    {
+      "format": "md",
+      "path": "/var/folders/7n/q_2j3bvd6v348r15ph2j8jzh0000gn/T/lecturedesk-packaged-material-T8bjc2/exported-multilingual.md",
+      "size": 130,
+      "sha256": "1a77369cefe30c2d83ef179210ffa17229f9497a6b9cb4b36699c2f040f19e5b"
+    },
+    {
+      "format": "docx",
+      "path": "/var/folders/7n/q_2j3bvd6v348r15ph2j8jzh0000gn/T/lecturedesk-packaged-material-T8bjc2/exported-multilingual.docx",
+      "size": 9651,
+      "sha256": "375599148ef5a2bd5626e57bc43c35f2bd04710192d7dd5959346fd29b959e2a"
+    },
+    {
+      "format": "pdf",
+      "path": "/var/folders/7n/q_2j3bvd6v348r15ph2j8jzh0000gn/T/lecturedesk-packaged-material-T8bjc2/exported-multilingual.pdf",
+      "size": 10059,
+      "sha256": "df6469d211a630df92d57921e599b80dcd6c5ee2bcc37f63bcccab73b9b85251"
+    }
+  ],
+  "importedMaterials": [
+    {
+      "name": "multilingual-text.pdf",
+      "status": "ready",
+      "pages": [
+        {
+          "page": 1,
+          "ocr": false,
+          "characters": 85
+        }
+      ]
+    },
+    {
+      "name": "scanned-two-pages.pdf",
+      "status": "ready",
+      "pages": [
+        {
+          "page": 1,
+          "ocr": true,
+          "characters": 26
+        },
+        {
+          "page": 2,
+          "ocr": true,
+          "characters": 21
+        }
+      ]
+    },
+    {
+      "name": "ocr-image.png",
+      "status": "ready",
+      "pages": [
+        {
+          "page": 1,
+          "ocr": true,
+          "characters": 26
+        }
+      ]
+    },
+    {
+      "name": "multilingual-document.docx",
+      "status": "ready",
+      "pages": [
+        {
+          "page": 1,
+          "ocr": false,
+          "characters": 87
+        }
+      ]
+    },
+    {
+      "name": "multilingual-text.txt",
+      "status": "ready",
+      "pages": [
+        {
+          "page": 1,
+          "ocr": false,
+          "characters": 85
+        }
+      ]
+    },
+    {
+      "name": "exported-multilingual.txt",
+      "status": "ready",
+      "pages": [
+        {
+          "page": 1,
+          "ocr": false,
+          "characters": 85
+        }
+      ]
+    },
+    {
+      "name": "exported-multilingual.md",
+      "status": "ready",
+      "pages": [
+        {
+          "page": 1,
+          "ocr": false,
+          "characters": 85
+        }
+      ]
+    },
+    {
+      "name": "exported-multilingual.docx",
+      "status": "ready",
+      "pages": [
+        {
+          "page": 1,
+          "ocr": false,
+          "characters": 158
+        }
+      ]
+    },
+    {
+      "name": "exported-multilingual.pdf",
+      "status": "ready",
+      "pages": [
+        {
+          "page": 1,
+          "ocr": false,
+          "characters": 156
+        }
+      ]
+    }
+  ]
+}

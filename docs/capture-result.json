@@ -1,0 +1,111 @@
+{
+  "platform": "darwin",
+  "architecture": "arm64",
+  "packaged": true,
+  "executedAt": "2026-10-03T18:28:09.103Z",
+  "appAsarSha256": "2a187e6e2a87c3bb97306580863064fca6bf00bcefe636cf0d767850b8822d1c",
+  "profile": "/var/folders/7n/q_2j3bvd6v348r15ph2j8jzh0000gn/T/lecturedesk-capture-check-SZkOSY",
+  "results": [
+    {
+      "mode": "microphone",
+      "passed": true,
+      "duration": 6.773333333333333,
+      "segments": 2,
+      "peak": 0.021942138671875,
+      "rms": 0.0032635428434806915,
+      "acquisition": [
+        {
+          "method": "getUserMedia",
+          "tracks": [
+            {
+              "kind": "audio",
+              "label": "Default - Микрофон MacBook Pro (Built-in)",
+              "readyState": "live"
+            }
+          ]
+        }
+      ],
+      "playback": {
+        "duration": 4.597333,
+        "rate": 1.5,
+        "initialPosition": 1.000061,
+        "playedTo": 1.298427
+      }
+    },
+    {
+      "mode": "system",
+      "passed": true,
+      "duration": 6.8,
+      "segments": 2,
+      "peak": 0.018280029296875,
+      "rms": 0.0030608577466733535,
+      "acquisition": [
+        {
+          "method": "getDisplayMedia",
+          "tracks": [
+            {
+              "kind": "audio",
+              "label": "System audio",
+              "readyState": "live"
+            },
+            {
+              "kind": "video",
+              "label": "Весь экран",
+              "readyState": "live"
+            }
+          ]
+        }
+      ],
+      "playback": {
+        "duration": 4.629333,
+        "rate": 1.5,
+        "initialPosition": 1.000055,
+        "playedTo": 1.303176
+      }
+    },
+    {
+      "mode": "both",
+      "passed": true,
+      "duration": 6.810666666666666,
+      "segments": 2,
+      "peak": 0.013031005859375,
+      "rms": 0.0027808803835076717,
+      "acquisition": [
+        {
+          "method": "getDisplayMedia",
+          "tracks": [
+            {
+              "kind": "audio",
+              "label": "System audio",
+              "readyState": "live"
+            },
+            {
+              "kind": "video",
+              "label": "Весь экран",
+              "readyState": "live"
+            }
+          ]
+        },
+        {
+          "method": "getUserMedia",
+          "tracks": [
+            {
+              "kind": "audio",
+              "label": "Default - Микрофон MacBook Pro (Built-in)",
+              "readyState": "live"
+            }
+          ]
+        }
+      ],
+      "playback": {
+        "duration": 4.64,
+        "rate": 1.5,
+        "initialPosition": 1.000087,
+        "playedTo": 1.292763
+      }
+    }
+  ],
+  "rendererErrors": [],
+  "paidAPI": false,
+  "backend": "production"
+}

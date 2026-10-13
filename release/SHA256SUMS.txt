@@ -1,0 +1,3 @@
+a4fcd00d4ee878ddffa9c26682b5838fa7779527cb5aacf478584ba3999e69f4  release/LectureDesk-0.1.0-arm64.dmg
+0fde15f8ecabac9ce44dd9049c8b004736bd21accde6fa4a2e1778e495688a82  release/LectureDesk-0.1.0-arm64-mac.zip
+51b8be8c3ba2eb827dc46a38e6958552fabf324c93b23f0d6dae4cfd7aaf8c12  release/LectureDesk-0.1.0-source.zip

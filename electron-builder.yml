@@ -1,0 +1,42 @@
+appId: com.lecturedesk.app
+productName: LectureDesk
+directories:
+  output: release
+  buildResources: build
+files:
+  - out/**/*
+  - package.json
+asar: true
+asarUnpack:
+  # Node OCR/PDF workers need real filesystem module paths, including transitive dependencies.
+  - node_modules/**/*
+extraResources:
+  - from: resources
+    to: resources
+mac:
+  target:
+    - target: dmg
+      arch: arm64
+    - target: zip
+      arch: arm64
+  category: public.app-category.education
+  minimumSystemVersion: '15.0'
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  extendInfo:
+    NSMicrophoneUsageDescription: LectureDesk records your microphone only when you start recording or an audio test.
+    NSAudioCaptureUsageDescription: LectureDesk captures system audio for the recording source you select.
+    NSScreenCaptureUsageDescription: System audio capture uses the desktop capture permission. Screen video is never saved.
+    NSCameraUsageDescription: LectureDesk does not use the camera.
+win:
+  target:
+    - target: nsis
+      arch: x64
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  artifactName: LectureDesk-${version}-windows-x64-setup.${ext}
+publish: null

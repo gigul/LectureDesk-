@@ -1,0 +1,17 @@
+{
+  "passed": true,
+  "packaged": true,
+  "platform": "darwin",
+  "profile": "/var/folders/7n/q_2j3bvd6v348r15ph2j8jzh0000gn/T/lecturedesk-smoke-RzoSDE",
+  "checks": [
+    "onboarding rendering",
+    "secure IPC bridge",
+    "local create/import/version",
+    "light/dark rendering",
+    "real backup/preview/merge restore",
+    "trash restore",
+    "subject deletion preserves lecture",
+    "external protocol rejection"
+  ],
+  "rendererErrors": []
+}

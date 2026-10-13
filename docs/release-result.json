@@ -1,0 +1,53 @@
+{
+  "createdAt": "2026-10-03T18:31:47.091Z",
+  "platform": "darwin",
+  "architecture": "arm64",
+  "appAsarSha256": "2a187e6e2a87c3bb97306580863064fca6bf00bcefe636cf0d767850b8822d1c",
+  "unitTests": {
+    "passed": 72,
+    "skipped": 1
+  },
+  "acceleratedFourHour": {
+    "passed": true,
+    "physicalRecording": false,
+    "secondsOfPCM": 14400,
+    "segments": 1440,
+    "pcmBytes": 691200000,
+    "rssGrowthAssertionMiB": 192
+  },
+  "results": {
+    "capture": {
+      "passed": true,
+      "report": "docs/capture-result.json"
+    },
+    "credentials": {
+      "passed": true,
+      "report": "docs/credentials-result.json"
+    },
+    "packaged-material": {
+      "passed": true,
+      "report": "docs/packaged-material-result.json"
+    },
+    "smoke": {
+      "passed": true,
+      "report": "docs/smoke-result.json"
+    }
+  },
+  "dmgMatchesTestedApp": true,
+  "signed": false,
+  "notarized": false,
+  "windowsBuilt": false,
+  "paidOpenAICallsTested": false,
+  "artifacts": [
+    {
+      "path": "release/LectureDesk-0.1.0-arm64.dmg",
+      "bytes": 227338899,
+      "sha256": "a4fcd00d4ee878ddffa9c26682b5838fa7779527cb5aacf478584ba3999e69f4"
+    },
+    {
+      "path": "release/LectureDesk-0.1.0-arm64-mac.zip",
+      "bytes": 232078451,
+      "sha256": "0fde15f8ecabac9ce44dd9049c8b004736bd21accde6fa4a2e1778e495688a82"
+    }
+  ]
+}
