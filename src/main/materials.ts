@@ -12,6 +12,7 @@ import { XMLParser } from 'fast-xml-parser';
 import yauzl from 'yauzl';
 import type { Store } from './store.js';
 import type { Material, AppEvent, Segment } from '../shared/types.js';
+import { wavDataOffset } from './audio-range.js';
 
 const require = createRequire(typeof __filename === 'string' ? __filename : import.meta.url);
 function installedModule(specifier: string): string {
@@ -406,10 +407,9 @@ export class MaterialService {
     });
   }
   private ocrLanguages(): string[] {
+    // Slides and handouts are in the lecture language, often with English terms.
     const language = this.store.settings().lectureLanguage;
-    return language === 'auto'
-      ? ['eng', 'rus', 'ukr', 'pol']
-      : [{ en: 'eng', ru: 'rus', uk: 'ukr', pl: 'pol' }[language]];
+    return [...new Set([{ en: 'eng', ru: 'rus', uk: 'ukr', pl: 'pol' }[language], 'eng'])];
   }
   private async extract(material: Material): Promise<void> {
     try {
@@ -564,25 +564,11 @@ export class MaterialService {
     const segments: Segment[] = [];
     for (const file of files) {
       const filename = path.join(directory, file);
-      const stat = await fs.stat(filename);
       // FFmpeg WAV includes varying metadata; parse data chunk for exact sample count.
-      const handle = await fs.open(filename, 'r');
-      const header = Buffer.alloc(Math.min(stat.size, 64 * 1024));
-      try {
-        await handle.read(header, 0, header.length, 0);
-      } finally {
-        await handle.close();
-      }
-      let cursor = 12,
-        bytes = 0;
-      while (cursor + 8 <= header.length) {
-        const size = header.readUInt32LE(cursor + 4);
-        if (header.toString('ascii', cursor, cursor + 4) === 'data') {
-          bytes = size;
-          break;
-        }
-        cursor += 8 + size + (size % 2);
-      }
+      const bytes = await wavDataOffset(filename).then(
+        (info) => info.bytes,
+        () => 0,
+      );
       if (!bytes || bytes / 48000 > 301) throw new Error('Invalid converted audio segment');
       const duration = bytes / 48000;
       segments.push({

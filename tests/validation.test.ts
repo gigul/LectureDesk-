@@ -14,6 +14,13 @@ describe('privileged IPC validation', () => {
       validate('version.save', { lectureId: 'id', kind: 'edited', title: 'Edit', content: 'x' }),
     ).toMatchObject({ kind: 'edited' });
   });
+  it('accepts emptying the trash only without arguments', () => {
+    expect(validate('trash.empty', undefined)).toEqual({});
+    expect(validate('trash.empty', {})).toEqual({});
+    expect(() => validate('trash.empty', { lectureId: 'id' })).toThrow();
+    expect(() => validate('trash.empty', { includeActive: true })).toThrow();
+    expect(() => validate('trash.empty', 'all')).toThrow();
+  });
   it('caps recording batches and rejects arbitrary parameter payloads', () => {
     expect(() =>
       validate('record.chunk', { lectureId: 'id', sequence: 0, pcm: new ArrayBuffer(100000) }),

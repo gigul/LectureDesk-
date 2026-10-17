@@ -34,7 +34,11 @@ export function retrievalTerms(query: string) {
   return [...new Set(terms)].slice(0, 48);
 }
 
-/** Durable unicode-aware lexical index. Scope filtering occurs in SQL before passages reach the provider. */
+/**
+ * Durable unicode-aware lexical index. Scope filtering occurs in SQL before passages reach the provider.
+ * Source keys are `lecture:<id>` and `material:<id>`; Store.forgetRetrieval deletes them when a lecture
+ * is permanently deleted, so keep table/key names in sync with it.
+ */
 export class LocalRetrieval {
   constructor(private store: Store) {
     store.db
@@ -92,7 +96,7 @@ export class LocalRetrieval {
         detail.versions.find((v) => v.kind === 'original');
       const key = `lecture:${lectureId}`,
         title = detail.lecture.title;
-      const content = version?.content ?? orderedTranscript(detail.segments);
+      const content = version?.content ?? orderedTranscript(detail.segments, detail.items);
       const chunks = textSections(content, 2600);
       const passages = chunks.map((text, index) => {
         const stamp = text.match(/\[(?:(\d+):)?(\d+):(\d+)\]/);

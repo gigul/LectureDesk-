@@ -2,6 +2,9 @@ import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import WebSocket from 'ws';
 import type { Language } from '../shared/types';
+import { turnPolicy } from '../shared/transcript';
+
+export { turnPolicy };
 
 export type KeyGetter = () => string | null | Promise<string | null>;
 export class APIError extends Error {
@@ -28,10 +31,16 @@ export interface TextResult {
 }
 export interface TranscribeRequest {
   model: string;
-  path: string;
-  language: Language | 'auto';
+  /** WAV file on disk (legacy segments, imported audio). */
+  path?: string;
+  /** In-memory WAV (disk ranges assembled from recorded segments); preferred over `path`. */
+  audio?: Buffer;
+  /** Callers resolve the lecture language; 'auto' is never sent. */
+  language: Language;
   glossary: string;
   context: string;
+  /** Retry after a language rejection: selected language only, no English allowance, no context. */
+  strict?: boolean;
 }
 export interface TranscriptResult {
   text: string;
@@ -52,27 +61,95 @@ export const createRealtimeSocket: SocketFactory = (key) =>
     maxPayload: 2 * 1024 * 1024,
   });
 
+/** Localized description of the recording; the speech model writes in the language of its prompt. */
+const SETTING: Record<Language, { lecture: string; english: string; terms: string }> = {
+  pl: {
+    lecture: 'Wykład uniwersytecki po polsku.',
+    english: 'Mogą pojawiać się angielskie terminy.',
+    terms: 'Terminy:',
+  },
+  ru: {
+    lecture: 'Университетская лекция на русском языке.',
+    english: 'Могут встречаться английские термины.',
+    terms: 'Термины:',
+  },
+  uk: {
+    lecture: 'Університетська лекція українською мовою.',
+    english: 'Можуть траплятися англійські терміни.',
+    terms: 'Терміни:',
+  },
+  en: { lecture: 'University lecture in English.', english: '', terms: 'Terms:' },
+};
+const family = (model: string, bases: string[]) =>
+  bases.some((base) => model === base || model.startsWith(`${base}-`));
+/** Models that take plural `languages` (+ `keywords`) instead of the singular `language` field. */
+export const usesLanguages = (model: string) => family(model, ['gpt-live-transcribe', 'gpt-transcribe']);
+
 export function transcriptionSettings(
   model: string,
-  language: Language | 'auto',
+  language: Language,
   glossary: string,
   realtime = false,
+  strict = false,
+  context = '',
 ) {
   const settings: Record<string, unknown> = { model };
+  const setting = SETTING[language];
   // Hints are vocabulary data. They are never instructions for the application.
-  const clean = glossary.replace(/[<>\r]/g, ' ').slice(0, model === 'whisper-1' ? 650 : 2000);
-  if (clean.trim()) settings.prompt = `Vocabulary that may occur in this lecture: ${clean}`;
-  if (model === 'gpt-transcribe' || model === 'gpt-live-transcribe') {
-    if (language !== 'auto') settings.languages = [language];
+  const clean = glossary.replace(/[<>\r]/g, ' ').trim();
+  const limit = model === 'whisper-1' ? 650 : 1800;
+  const header = [setting.lecture, !strict && language !== 'en' ? setting.english : '']
+    .filter(Boolean)
+    .join(' ');
+  const vocabulary = clean ? `\n${setting.terms} ${clean.slice(0, model === 'whisper-1' ? 300 : 900)}` : '';
+  const previous = !strict && context.trim() ? `\n${context.trim().slice(-700)}` : '';
+  settings.prompt = `${header}${vocabulary}${previous}`.slice(0, limit);
+  if (usesLanguages(model)) {
+    // Never send both fields: the plural one replaces `language` for these models.
+    settings.languages = strict || language === 'en' ? [language] : [language, 'en'];
     const keywords = clean
       .split(/[,;\n]/)
       .map((x) => x.trim())
       .filter(Boolean)
       .slice(0, 60);
     if (keywords.length) settings.keywords = keywords;
-    if (realtime && model === 'gpt-live-transcribe') settings.delay = 'medium';
-  } else if (language !== 'auto') settings.language = language;
+    if (realtime && family(model, ['gpt-live-transcribe'])) settings.delay = 'medium';
+  } else settings.language = language;
   return settings;
+}
+
+/**
+ * session.update for a realtime transcription window. 'server' policy lets OpenAI detect speech
+ * turns (semantic_vad with low eagerness, server_vad as fallback); 'local' disables turn detection
+ * and the application commits at pauses itself (required for gpt-live-transcribe / gpt-transcribe).
+ */
+export function realtimeSession(
+  model: string,
+  language: Language,
+  glossary: string,
+  policy: 'server' | 'local',
+  vadVariant: 'semantic' | 'server' = 'semantic',
+  eventId?: string,
+) {
+  return {
+    type: 'session.update',
+    ...(eventId ? { event_id: eventId } : {}),
+    session: {
+      type: 'transcription',
+      audio: {
+        input: {
+          format: { type: 'audio/pcm', rate: 24000 },
+          transcription: transcriptionSettings(model, language, glossary, true),
+          turn_detection:
+            policy === 'local'
+              ? null
+              : vadVariant === 'semantic'
+                ? { type: 'semantic_vad', eagerness: 'low' }
+                : { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 700 },
+        },
+      },
+    },
+  };
 }
 
 /** Production adapter. Tests inject a separate Provider; this adapter never returns demo output. */
@@ -163,8 +240,15 @@ export class OpenAIProvider implements Provider {
     };
   }
   async transcribe(request: TranscribeRequest, signal: AbortSignal): Promise<TranscriptResult> {
-    const info = await stat(request.path);
-    if (info.size > 25 * 1024 * 1024)
+    if (!request.audio && request.path && (await stat(request.path)).size > 25 * 1024 * 1024)
+      throw new APIError(
+        'Audio segment exceeds the 25 MB transcription limit. Import it again so it can be split.',
+        400,
+        'audio_too_large',
+      );
+    const audio = request.audio ?? (request.path ? await readFile(request.path) : undefined);
+    if (!audio) throw new APIError('No audio was supplied for transcription.', 400, 'missing_audio');
+    if (audio.length > 25 * 1024 * 1024)
       throw new APIError(
         'Audio segment exceeds the 25 MB transcription limit. Import it again so it can be split.',
         400,
@@ -173,24 +257,21 @@ export class OpenAIProvider implements Provider {
     const form = new FormData();
     form.set(
       'file',
-      new Blob([new Uint8Array(await readFile(request.path))], { type: 'audio/wav' }),
-      path.basename(request.path),
+      new Blob([new Uint8Array(audio)], { type: 'audio/wav' }),
+      request.path ? path.basename(request.path) : 'lecture-audio.wav',
     );
     for (const [key, value] of Object.entries(
-      transcriptionSettings(request.model, request.language, request.glossary),
+      transcriptionSettings(
+        request.model,
+        request.language,
+        request.glossary,
+        false,
+        request.strict,
+        request.context,
+      ),
     )) {
       if (Array.isArray(value)) for (const item of value) form.append(`${key}[]`, String(item));
       else form.set(key, String(value));
-    }
-    if (request.context.trim()) {
-      const previous = request.context.slice(-700);
-      form.set(
-        'prompt',
-        `Vocabulary: ${request.glossary.slice(0, 900)}\nPrevious audio transcript, context only: ${previous}`.slice(
-          0,
-          request.model === 'whisper-1' ? 650 : 1800,
-        ),
-      );
     }
     if (request.model === 'whisper-1') {
       form.set('response_format', 'verbose_json');

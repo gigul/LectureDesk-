@@ -16,6 +16,7 @@ import {
   type Lecture,
   type Subject,
   type Segment,
+  type TranscriptItem,
   type Version,
   type Material,
   type Gap,
@@ -29,6 +30,7 @@ import {
 type Tables = {
   subjects: Subject[];
   lectures: Lecture[];
+  transcript_items: TranscriptItem[];
   segments: Segment[];
   versions: Version[];
   materials: Material[];
@@ -39,8 +41,9 @@ type Tables = {
   usage: Usage[];
   tasks: Task[];
 };
+/** Schema 2 adds `transcript_items`; schema-1 archives (no items) still restore. */
 type ArchiveData = {
-  schema: 1;
+  schema: 1 | 2;
   kind: 'lecture' | 'backup';
   createdAt: string;
   audioIncluded: boolean;
@@ -65,6 +68,7 @@ export type ArchivePreview = {
 const tableNames = [
   'subjects',
   'lectures',
+  'transcript_items',
   'segments',
   'versions',
   'materials',
@@ -90,6 +94,20 @@ const columns: Record<keyof Tables, string[]> = {
     'createdAt',
     'deletedAt',
     'activeVersionId',
+  ],
+  transcript_items: [
+    'id',
+    'lectureId',
+    'start',
+    'end',
+    'text',
+    'status',
+    'source',
+    'model',
+    'language',
+    'error',
+    'sourceKey',
+    'createdAt',
   ],
   segments: ['id', 'lectureId', 'sequence', 'start', 'end', 'path', 'text', 'status', 'error'],
   versions: [
@@ -279,8 +297,10 @@ async function walkFiles(root: string, relative = ''): Promise<string[]> {
   return result;
 }
 function validateData(data: ArchiveData, entries: Set<string>): void {
+  if (data && data.schema === 1 && data.tables && typeof data.tables === 'object')
+    data.tables.transcript_items ??= [];
   if (
-    data.schema !== 1 ||
+    (data.schema !== 1 && data.schema !== 2) ||
     !['lecture', 'backup'].includes(data.kind) ||
     !data.tables ||
     typeof data.createdAt !== 'string' ||
@@ -315,10 +335,26 @@ function validateData(data: ArchiveData, entries: Set<string>): void {
   const lectures = new Set(data.tables.lectures.map((row) => row.id));
   const versions = new Map(data.tables.versions.map((row) => [row.id, row]));
   const conversations = new Set(data.tables.conversations.map((row) => row.id));
-  for (const table of ['segments', 'versions', 'materials', 'gaps', 'usage', 'tasks'] as const)
+  for (const table of ['transcript_items', 'segments', 'versions', 'materials', 'gaps', 'usage', 'tasks'] as const)
     for (const row of data.tables[table])
       if (row.lectureId && !lectures.has(row.lectureId))
         throw new Error('Archive references a missing lecture');
+  const itemKeys = new Set<string>();
+  for (const row of data.tables.transcript_items) {
+    const key = `${row.lectureId}:${row.sourceKey}`;
+    if (
+      !row.lectureId ||
+      typeof row.sourceKey !== 'string' ||
+      typeof row.text !== 'string' ||
+      typeof row.start !== 'number' ||
+      typeof row.end !== 'number' ||
+      row.end < row.start ||
+      !['done', 'rejected'].includes(row.status) ||
+      itemKeys.has(key)
+    )
+      throw new Error('Invalid transcript item');
+    itemKeys.add(key);
+  }
   for (const row of [...data.tables.lectures, ...data.tables.materials])
     if (row.subjectId && !subjects.has(row.subjectId))
       throw new Error('Archive references a missing subject');
@@ -586,6 +622,9 @@ export class Portability {
         'materialIds',
         'segmentIds',
         'coverageSegmentIds',
+        'itemId',
+        'itemIds',
+        'coverageItemIds',
       ]);
       const mapReferences = (value: unknown, key = ''): unknown => {
         if (typeof value === 'string') return referenceNames.has(key) ? ids.get(value) || value : value;
@@ -631,6 +670,23 @@ export class Portability {
                 row.status = 'cancelled';
                 row.error = 'Audio was excluded from this backup';
               }
+              // Disk transcription of recorded ranges needs the audio files.
+              const readsAudio =
+                row.kind === 'transcribe-range' || (row.kind === 'improve' && payload.mode === 'range');
+              if (readsAudio) {
+                // A restored realtime window is never live again: its unconfirmed audio is disk work.
+                if (payload.livePending) row.payload = { ...payload, livePending: false };
+                if (row.status !== 'done' && row.status !== 'cancelled') row.nextRun = 0;
+                if (!data.audioIncluded && row.status !== 'done') {
+                  row.status = 'cancelled';
+                  row.error = 'Audio was excluded from this backup';
+                }
+              }
+            }
+            // Chunk results are keyed by their task; keep that link after task IDs are remapped.
+            if (table === 'transcript_items') {
+              const match = /^range:([^:]+):(\d+)$/.exec(String(row.sourceKey));
+              if (match && ids.has(match[1])) row.sourceKey = `range:${ids.get(match[1])}:${match[2]}`;
             }
             // Deferrable foreign key checking supports source-version references in any archive order.
             const names = columns[table];
@@ -682,7 +738,7 @@ export class Portability {
         if (!lecture) throw new Error('Lecture does not exist');
         tables.lectures = [lecture];
         tables.subjects = tables.subjects.filter((subject) => subject.id === lecture.subjectId);
-        for (const table of ['segments', 'versions', 'gaps', 'usage', 'tasks'] as const)
+        for (const table of ['transcript_items', 'segments', 'versions', 'gaps', 'usage', 'tasks'] as const)
           (tables[table] as unknown[]) = (tables[table] as { lectureId: string | null }[]).filter(
             (item) => item.lectureId === lectureId,
           );
@@ -739,7 +795,7 @@ export class Portability {
           item.path = member;
         }
       const data: ArchiveData = {
-        schema: 1,
+        schema: 2,
         kind: lectureId ? 'lecture' : 'backup',
         createdAt: new Date().toISOString(),
         audioIncluded: includeAudio,

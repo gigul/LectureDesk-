@@ -1,0 +1,7 @@
+# Dependencies and build output (reproducible from package-lock.json and source)
+node_modules/
+out/
+release/
+
+# macOS Finder metadata
+.DS_Store

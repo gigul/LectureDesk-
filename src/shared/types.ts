@@ -4,7 +4,10 @@ export type VersionKind = 'original' | 'edited' | 'improved' | 'translation' | '
 export interface Settings {
   setupComplete: boolean;
   uiLanguage: Language;
-  lectureLanguage: Language | 'auto';
+  /** Transcripts may contain only this language plus English. 'auto' is migrated away (schema v3). */
+  lectureLanguage: Language;
+  /** False until the user explicitly chose the lecture language (wizard, settings or one-time prompt). */
+  lectureLanguageConfirmed: boolean;
   outputLanguage: Language;
   theme: 'light' | 'dark' | 'system';
   storageFolder: string;
@@ -57,8 +60,29 @@ export interface Segment {
   end: number;
   path: string;
   text: string;
-  status: 'queued' | 'processing' | 'done' | 'error';
+  /**
+   * 'audio': recorded audio kept for backup/playback; its text lives in transcript items.
+   * Other statuses belong to legacy recordings and imported audio transcribed per segment.
+   */
+  status: 'queued' | 'processing' | 'done' | 'error' | 'audio';
   error: string | null;
+}
+/** One finalized speech turn (live) or silence-split chunk (file) of a lecture, in lecture seconds. */
+export interface TranscriptItem {
+  id: string;
+  lectureId: string;
+  start: number;
+  end: number;
+  text: string;
+  /** 'rejected': not in the lecture language or English; hidden from the transcript, audio preserved. */
+  status: 'done' | 'rejected';
+  source: 'live' | 'file';
+  model: string;
+  language: string | null;
+  error: string | null;
+  /** 'live:<windowId>:<item_id>' | 'range:<taskId>:<chunkIndex>' | 'segment:<segmentId>' */
+  sourceKey: string;
+  createdAt: string;
 }
 export interface Version {
   id: string;
@@ -170,6 +194,7 @@ export interface LibrarySnapshot {
 export interface LectureDetail {
   lecture: Lecture;
   segments: Segment[];
+  items: TranscriptItem[];
   versions: Version[];
   materials: Material[];
   gaps: Gap[];
@@ -180,6 +205,8 @@ export interface AppEvent {
   lectureId?: string;
   segmentId?: string;
   text?: string;
+  /** Partial events: lecture seconds where the preliminary phrase starts. */
+  start?: number;
   message?: string;
   progress?: number;
 }
@@ -193,6 +220,7 @@ export const METHODS = [
   'lecture.trash',
   'lecture.restore',
   'lecture.recover',
+  'trash.empty',
   'version.save',
   'version.activate',
   'settings.save',
@@ -244,7 +272,8 @@ declare global {
 export const DEFAULT_SETTINGS: Settings = {
   setupComplete: false,
   uiLanguage: 'ru',
-  lectureLanguage: 'auto',
+  lectureLanguage: 'ru',
+  lectureLanguageConfirmed: false,
   outputLanguage: 'ru',
   theme: 'light',
   storageFolder: '',
@@ -258,7 +287,7 @@ export const DEFAULT_SETTINGS: Settings = {
   translationWaitSeconds: 30,
   analysisWords: 500,
   analysisIntervalSeconds: 60,
-  liveModel: 'gpt-live-transcribe',
+  liveModel: 'gpt-4o-transcribe',
   fileModel: 'gpt-transcribe',
   translationModel: 'gpt-6.1-sol',
   analysisModel: 'gpt-6.1-sol',
@@ -270,7 +299,8 @@ export const DEFAULT_SETTINGS: Settings = {
   backupRetention: 5,
 };
 export const MODEL_CATALOG = {
-  live: ['gpt-live-transcribe', 'gpt-transcribe', 'gpt-4o-transcribe', 'gpt-4o-mini-transcribe'],
+  // First entry = default/maximum preset: server-side turn detection (see turnPolicy in shared/transcript.ts).
+  live: ['gpt-4o-transcribe', 'gpt-live-transcribe', 'gpt-transcribe', 'gpt-4o-mini-transcribe'],
   file: ['gpt-transcribe', 'gpt-4o-transcribe', 'gpt-4o-mini-transcribe', 'whisper-1'],
   text: ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna', 'gpt-5.4', 'gpt-4.1'],
 };

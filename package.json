@@ -13,7 +13,9 @@
     "test:watch": "vitest",
     "resources": "node scripts/resources.mjs",
     "icon": "node scripts/icon.mjs",
-    "dist:mac": "npm run resources && npm run build && electron-builder --mac --arm64",
+    "dist:mac": "npm run resources && npm run build && electron-builder --mac",
+    "dist:mac:arm64": "npm run resources && npm run build && electron-builder --mac --arm64",
+    "dist:mac:x64": "npm run resources && npm run build && electron-builder --mac --x64",
     "dist:win": "npm run resources && npm run build && electron-builder --win --x64",
     "pack": "npm run resources && npm run build && electron-builder --dir",
     "verify": "npm run typecheck && npm test && npm run build"

@@ -6,19 +6,19 @@ const node_url = require("node:url");
 const node_crypto = require("node:crypto");
 const node_sqlite = require("node:sqlite");
 const node_child_process = require("node:child_process");
-const promises = require("node:stream/promises");
+const promises$1 = require("node:stream/promises");
 const node_module = require("node:module");
 const node_worker_threads = require("node:worker_threads");
 const mammoth = require("mammoth");
 const tesseract_js = require("tesseract.js");
 const fastXmlParser = require("fast-xml-parser");
 const yauzl = require("yauzl");
+const promises = require("node:fs/promises");
 const os = require("node:os");
 const archiver = require("archiver");
 const PDFDocument = require("pdfkit");
 const docx = require("docx");
 const WebSocket = require("ws");
-const promises$1 = require("node:fs/promises");
 const node_stream = require("node:stream");
 const zod = require("zod");
 const METHODS = [
@@ -31,6 +31,7 @@ const METHODS = [
   "lecture.trash",
   "lecture.restore",
   "lecture.recover",
+  "trash.empty",
   "version.save",
   "version.activate",
   "settings.save",
@@ -71,7 +72,8 @@ const METHODS = [
 const DEFAULT_SETTINGS = {
   setupComplete: false,
   uiLanguage: "ru",
-  lectureLanguage: "auto",
+  lectureLanguage: "ru",
+  lectureLanguageConfirmed: false,
   outputLanguage: "ru",
   theme: "light",
   storageFolder: "",
@@ -85,7 +87,7 @@ const DEFAULT_SETTINGS = {
   translationWaitSeconds: 30,
   analysisWords: 500,
   analysisIntervalSeconds: 60,
-  liveModel: "gpt-live-transcribe",
+  liveModel: "gpt-4o-transcribe",
   fileModel: "gpt-transcribe",
   translationModel: "gpt-6.1-sol",
   analysisModel: "gpt-6.1-sol",
@@ -97,11 +99,17 @@ const DEFAULT_SETTINGS = {
   backupRetention: 5
 };
 const MODEL_CATALOG = {
-  live: ["gpt-live-transcribe", "gpt-transcribe", "gpt-4o-transcribe", "gpt-4o-mini-transcribe"],
+  // First entry = default/maximum preset: server-side turn detection (see turnPolicy in shared/transcript.ts).
+  live: ["gpt-4o-transcribe", "gpt-live-transcribe", "gpt-transcribe", "gpt-4o-mini-transcribe"],
   file: ["gpt-transcribe", "gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1"],
   text: ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-5.4", "gpt-4.1"]
 };
+const pad = (value) => String(value).padStart(2, "0");
+function localIsoDate(date) {
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
 const now = () => (/* @__PURE__ */ new Date()).toISOString();
+const LIBRARY_CONTENT = ["audio", "lectures", "materials", "restored"];
 const jsonFields$1 = /* @__PURE__ */ new Set(["tags", "parameters", "pages", "payload", "context", "sources", "data"]);
 function decode(row) {
   if (!row) return void 0;
@@ -131,7 +139,12 @@ class Store {
     this.db.exec(
       "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;"
     );
-    this.migrate();
+    try {
+      this.migrate();
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
     this.db.exec(
       "UPDATE tasks SET status='queued',nextRun=0 WHERE status='running'; UPDATE lectures SET status='interrupted' WHERE status IN ('recording','paused','importing'); UPDATE materials SET status='error',error='Import was interrupted. Retry to continue from the preserved original.' WHERE status='processing';"
     );
@@ -139,18 +152,41 @@ class Store {
   get root() {
     return this.settings().storageFolder || this.baseRoot;
   }
+  schemaVersion() {
+    return Number(this.db.prepare("PRAGMA user_version").get().user_version);
+  }
+  /**
+   * Sequential schema steps keyed by the version they produce. Each step runs in its own
+   * BEGIN IMMEDIATE transaction together with its `PRAGMA user_version` bump, so a crash
+   * leaves the library at the previous complete version. Append new steps at the end.
+   */
+  migrations = [
+    { to: 1, run: (defaults) => this.createSchemaV1(defaults) },
+    { to: 2, run: () => this.allowPermanentDeletionOfTrashedOriginals() },
+    { to: 3, run: () => this.addTranscriptItems() }
+  ];
   migrate() {
-    const version = Number(
-      this.db.prepare("PRAGMA user_version").get().user_version
-    );
-    if (version > 1) throw new Error("This library was created by a newer version of LectureDesk.");
+    const latest = this.migrations[this.migrations.length - 1].to;
+    if (this.schemaVersion() > latest)
+      throw new Error("This library was created by a newer version of LectureDesk.");
     const defaults = JSON.stringify({ ...DEFAULT_SETTINGS, storageFolder: this.baseRoot });
-    if (version === 1) {
-      this.db.prepare("INSERT OR IGNORE INTO settings(id,data) VALUES(1,?)").run(defaults);
-      return;
+    for (const step of this.migrations) {
+      if (step.to <= this.schemaVersion()) continue;
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        step.run(defaults);
+        this.db.exec(`PRAGMA user_version=${step.to}`);
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
     }
-    try {
-      this.db.exec(`BEGIN IMMEDIATE;
+    this.db.prepare("INSERT OR IGNORE INTO settings(id,data) VALUES(1,?)").run(defaults);
+  }
+  /** 0 → 1: initial schema. */
+  createSchemaV1(defaults) {
+    this.db.exec(`
       CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
       CREATE TABLE subjects (id TEXT PRIMARY KEY,name TEXT NOT NULL,color TEXT NOT NULL,glossary TEXT NOT NULL,createdAt TEXT NOT NULL);
       CREATE TABLE lectures (id TEXT PRIMARY KEY,subjectId TEXT REFERENCES subjects(id) ON DELETE SET NULL,title TEXT NOT NULL,topic TEXT NOT NULL,date TEXT NOT NULL,tags TEXT NOT NULL,status TEXT NOT NULL,duration REAL NOT NULL,createdAt TEXT NOT NULL,deletedAt TEXT,activeVersionId TEXT);
@@ -167,12 +203,40 @@ class Store {
       CREATE TABLE messages (id TEXT PRIMARY KEY,conversationId TEXT NOT NULL REFERENCES conversations(id),role TEXT NOT NULL,content TEXT NOT NULL,sources TEXT NOT NULL,createdAt TEXT NOT NULL);
       CREATE TABLE usage (id TEXT PRIMARY KEY,lectureId TEXT REFERENCES lectures(id),operation TEXT NOT NULL,model TEXT NOT NULL,data TEXT NOT NULL,createdAt TEXT NOT NULL);
       CREATE INDEX segments_order ON segments(lectureId,sequence); CREATE INDEX tasks_queue ON tasks(status,nextRun); CREATE INDEX materials_lecture ON materials(lectureId); CREATE INDEX versions_lecture ON versions(lectureId,createdAt);`);
-      this.db.prepare("INSERT INTO settings(id,data) VALUES(1,?)").run(defaults);
-      this.db.exec("PRAGMA user_version=1; COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
+    this.db.prepare("INSERT INTO settings(id,data) VALUES(1,?)").run(defaults);
+  }
+  /**
+   * 1 → 2: originals stay immutable, but permanently deleting a lecture that is already in
+   * Trash may remove its original. Updates remain forbidden unconditionally.
+   */
+  allowPermanentDeletionOfTrashedOriginals() {
+    this.db.exec(`
+      DROP TRIGGER IF EXISTS original_delete;
+      CREATE TRIGGER original_delete BEFORE DELETE ON versions
+        WHEN OLD.kind='original' AND NOT EXISTS (SELECT 1 FROM lectures WHERE id=OLD.lectureId AND deletedAt IS NOT NULL)
+        BEGIN SELECT RAISE(ABORT,'Original transcripts are immutable'); END;`);
+  }
+  /**
+   * 2 → 3: finalized speech turns / silence-split chunks live in `transcript_items` (new recordings
+   * keep segments as audio only). Settings: the 'auto' lecture language is replaced by an explicit
+   * language that the user confirms once; the old default live model moves to the new default.
+   */
+  addTranscriptItems() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS transcript_items (id TEXT PRIMARY KEY,lectureId TEXT NOT NULL REFERENCES lectures(id),start REAL NOT NULL,end REAL NOT NULL,text TEXT NOT NULL,status TEXT NOT NULL,source TEXT NOT NULL,model TEXT NOT NULL,language TEXT,error TEXT,sourceKey TEXT NOT NULL,createdAt TEXT NOT NULL,UNIQUE(lectureId,sourceKey));
+      CREATE INDEX IF NOT EXISTS transcript_items_order ON transcript_items(lectureId,start);`);
+    const row = this.db.prepare("SELECT data FROM settings WHERE id=1").get();
+    if (!row) return;
+    const data = JSON.parse(row.data);
+    const languages = ["ru", "uk", "en", "pl"];
+    const ui = languages.includes(String(data.uiLanguage)) ? String(data.uiLanguage) : DEFAULT_SETTINGS.uiLanguage;
+    if (!("lectureLanguageConfirmed" in data)) {
+      const explicit = languages.includes(String(data.lectureLanguage));
+      data.lectureLanguageConfirmed = explicit && data.setupComplete === true;
+      if (!explicit) data.lectureLanguage = ui;
     }
+    if (data.liveModel === "gpt-live-transcribe") data.liveModel = DEFAULT_SETTINGS.liveModel;
+    this.db.prepare("UPDATE settings SET data=? WHERE id=1").run(JSON.stringify(data));
   }
   rows(table, where = "", values = [], order = "") {
     return this.db.prepare(`SELECT * FROM ${table}${where ? ` WHERE ${where}` : ""}${order ? ` ORDER BY ${order}` : ""}`).all(...values).map((row) => decode(row));
@@ -203,7 +267,12 @@ class Store {
   }
   settings() {
     const row = this.db.prepare("SELECT data FROM settings WHERE id=1").get();
-    return { ...DEFAULT_SETTINGS, ...JSON.parse(row.data) };
+    const settings = { ...DEFAULT_SETTINGS, ...JSON.parse(row.data) };
+    if (!["ru", "uk", "en", "pl"].includes(settings.lectureLanguage)) {
+      settings.lectureLanguage = settings.uiLanguage;
+      settings.lectureLanguageConfirmed = false;
+    }
+    return settings;
   }
   saveSettings(patch) {
     const clean = {};
@@ -251,7 +320,7 @@ class Store {
       subjectId: input.subjectId || null,
       title: input.title?.trim() || "Untitled lecture",
       topic: "",
-      date: now().slice(0, 10),
+      date: localIsoDate(/* @__PURE__ */ new Date()),
       tags: [],
       status: "ready",
       duration: 0,
@@ -268,6 +337,7 @@ class Store {
     return {
       lecture,
       segments: this.rows("segments", "lectureId=?", [id2], "sequence"),
+      items: this.rows("transcript_items", "lectureId=?", [id2], "start,sourceKey"),
       versions: this.rows("versions", "lectureId=?", [id2], "createdAt,id"),
       materials: this.rows("materials", "lectureId=?", [id2], "createdAt"),
       gaps: this.rows("gaps", "lectureId=?", [id2], "at"),
@@ -294,6 +364,156 @@ class Store {
   }
   lectureRestore(id2) {
     this.lectureSave({ id: id2, deletedAt: null });
+  }
+  /** Permanently deletes one lecture that is already in Trash, including its original and files. */
+  lecturePurge(id2) {
+    const plan = this.scrubbed(() => this.transaction(() => this.purgeRows(id2)));
+    this.removeLibraryFiles(plan);
+  }
+  /** Permanently deletes every lecture in Trash. Nothing is deleted if any of them is busy. */
+  trashEmpty() {
+    const plans = this.scrubbed(
+      () => this.transaction(() => {
+        const trashed = this.rows("lectures", "deletedAt IS NOT NULL");
+        for (const lecture of trashed) this.assertPurgeable(lecture);
+        return trashed.map((lecture) => this.purgeRows(lecture.id));
+      })
+    );
+    this.removeLibraryFiles({
+      directories: plans.flatMap((plan) => plan.directories),
+      files: plans.flatMap((plan) => plan.files)
+    });
+    return { count: plans.length };
+  }
+  /** Overwrites freed database pages and flushes the WAL so deleted text does not linger on disk. */
+  scrubbed(operation) {
+    const previous = Number(
+      this.db.prepare("PRAGMA secure_delete").get().secure_delete
+    );
+    this.db.exec("PRAGMA secure_delete=ON");
+    try {
+      return operation();
+    } finally {
+      this.db.exec(`PRAGMA secure_delete=${previous ? "ON" : "OFF"}`);
+      try {
+        this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      } catch {
+      }
+    }
+  }
+  assertPurgeable(lecture) {
+    if (!lecture.deletedAt) throw new Error("Only lectures in Trash can be deleted permanently");
+    if (["recording", "paused", "importing"].includes(lecture.status))
+      throw new Error("Wait for recording or import to finish before deleting this lecture permanently");
+    if (this.rows("materials", "lectureId=? AND status='processing'", [lecture.id]).length)
+      throw new Error("Wait for file processing to finish before deleting this lecture permanently");
+  }
+  /** Deletes the lecture's rows (caller owns the transaction) and returns the files to remove afterwards. */
+  purgeRows(id2) {
+    const lecture = this.rows("lectures", "id=?", [id2])[0];
+    if (!lecture) throw new Error("Lecture does not exist");
+    this.assertPurgeable(lecture);
+    const segments = this.rows("segments", "lectureId=?", [id2]);
+    const materials = this.rows("materials", "lectureId=?", [id2]);
+    this.db.exec("PRAGMA defer_foreign_keys=ON");
+    const run = (sql) => this.db.prepare(sql).run(id2);
+    run("DELETE FROM tasks WHERE lectureId=?");
+    run("DELETE FROM usage WHERE lectureId=?");
+    run("DELETE FROM gaps WHERE lectureId=?");
+    run("DELETE FROM transcript_items WHERE lectureId=?");
+    run("DELETE FROM segments WHERE lectureId=?");
+    run("UPDATE lectures SET activeVersionId=NULL WHERE id=?");
+    run("DELETE FROM versions WHERE lectureId=?");
+    run("DELETE FROM materials WHERE lectureId=?");
+    this.forgetRetrieval([`lecture:${id2}`, ...materials.map((material) => `material:${material.id}`)]);
+    run("DELETE FROM lectures WHERE id=?");
+    return {
+      directories: [path.join("audio", id2), path.join("lectures", id2)],
+      files: [...segments, ...materials].map((item) => item.path).filter(Boolean)
+    };
+  }
+  /** Removes chat retrieval passages (tables owned by LocalRetrieval in ai-retrieval.ts), if indexed. */
+  forgetRetrieval(sourceKeys) {
+    const tables = new Set(
+      this.db.prepare(
+        "SELECT name FROM sqlite_master WHERE name IN ('ai_passage_fts','ai_passages','ai_index_sources')"
+      ).all().map((row) => row.name)
+    );
+    for (const key of sourceKeys) {
+      if (tables.has("ai_passage_fts") && tables.has("ai_passages"))
+        this.db.prepare("DELETE FROM ai_passage_fts WHERE id IN (SELECT id FROM ai_passages WHERE sourceKey=?)").run(key);
+      if (tables.has("ai_passages")) this.db.prepare("DELETE FROM ai_passages WHERE sourceKey=?").run(key);
+      if (tables.has("ai_index_sources"))
+        this.db.prepare("DELETE FROM ai_index_sources WHERE sourceKey=?").run(key);
+    }
+  }
+  /**
+   * Best-effort removal of purged library files. Only paths inside a content folder of `root`
+   * are touched; links are never followed and files still referenced by other rows are kept.
+   */
+  removeLibraryFiles(plan) {
+    const root = path.resolve(this.root);
+    let realRoot;
+    try {
+      realRoot = node_fs.realpathSync(root);
+    } catch {
+      return;
+    }
+    const outside = (rel) => !rel || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel);
+    const contained = (target) => {
+      const resolved = path.resolve(root, target);
+      const rel = path.relative(root, resolved);
+      if (outside(rel)) return null;
+      const parts = rel.split(path.sep);
+      if (parts.length < 2 || !LIBRARY_CONTENT.includes(parts[0])) return null;
+      try {
+        const parent = node_fs.realpathSync(path.dirname(resolved));
+        if (parent !== realRoot && outside(path.relative(realRoot, parent))) return null;
+        if (node_fs.lstatSync(resolved).isSymbolicLink()) return null;
+      } catch {
+        return null;
+      }
+      return resolved;
+    };
+    const key = (value) => process.platform === "win32" ? value.toLowerCase() : value;
+    const referenced = new Set(
+      this.db.prepare("SELECT path FROM segments WHERE path<>'' UNION SELECT path FROM materials WHERE path<>''").all().map((row) => key(path.resolve(root, row.path)))
+    );
+    const stillUsed = (target, directory) => {
+      if (referenced.has(key(target))) return true;
+      if (!directory) return false;
+      const prefix = key(target + path.sep);
+      for (const file of referenced) if (file.startsWith(prefix)) return true;
+      return false;
+    };
+    for (const directory of plan.directories) {
+      const target = contained(directory);
+      if (!target || stillUsed(target, true)) continue;
+      try {
+        if (node_fs.lstatSync(target).isDirectory())
+          node_fs.rmSync(target, { recursive: true, force: true, maxRetries: 2, retryDelay: 50 });
+      } catch (error) {
+        console.warn("LectureDesk: could not remove purged folder", target, error);
+      }
+    }
+    for (const file of plan.files) {
+      const target = contained(file);
+      if (!target || stillUsed(target, false)) continue;
+      try {
+        if (node_fs.lstatSync(target).isDirectory()) continue;
+        node_fs.unlinkSync(target);
+      } catch (error) {
+        console.warn("LectureDesk: could not remove purged file", target, error);
+        continue;
+      }
+      for (let folder = path.dirname(target); path.relative(root, folder).split(path.sep).length >= 2 && !outside(path.relative(root, folder)); folder = path.dirname(folder)) {
+        try {
+          node_fs.rmdirSync(folder);
+        } catch {
+          break;
+        }
+      }
+    }
   }
   versionSave(input) {
     return this.transaction(() => {
@@ -337,6 +557,34 @@ class Store {
   segmentUpdate(id2, patch) {
     this.update("segments", id2, patch, ["text", "status", "error"]);
   }
+  /** Idempotent by (lectureId, sourceKey): a repeated save returns the row stored first. */
+  itemSave(input) {
+    const item = {
+      id: input.id ?? node_crypto.randomUUID(),
+      lectureId: input.lectureId,
+      start: input.start,
+      end: Math.max(input.start, input.end),
+      text: input.text,
+      status: input.status,
+      source: input.source,
+      model: input.model,
+      language: input.language ?? null,
+      error: input.error ?? null,
+      sourceKey: input.sourceKey,
+      createdAt: input.createdAt ?? now()
+    };
+    const entries = Object.entries(item);
+    this.db.prepare(
+      `INSERT INTO transcript_items (${entries.map(([key]) => key).join(",")}) VALUES (${entries.map(() => "?").join(",")}) ON CONFLICT(lectureId,sourceKey) DO NOTHING`
+    ).run(...entries.map(([key, value]) => encode(key, value)));
+    return this.rows("transcript_items", "lectureId=? AND sourceKey=?", [
+      item.lectureId,
+      item.sourceKey
+    ])[0];
+  }
+  itemUpdate(id2, patch) {
+    this.update("transcript_items", id2, patch, ["text", "status", "error", "language"]);
+  }
   gap(lectureId2, at, reason) {
     const gap = { id: node_crypto.randomUUID(), lectureId: lectureId2, at, reason, createdAt: now() };
     this.insert("gaps", gap);
@@ -375,6 +623,9 @@ class Store {
   }
   tasks() {
     return this.rows("tasks", "", [], "createdAt");
+  }
+  taskGet(id2) {
+    return this.rows("tasks", "id=?", [id2])[0];
   }
   materialSave(material) {
     this.insert("materials", material);
@@ -427,6 +678,242 @@ class Store {
     this.db.close();
   }
 }
+const SAMPLE_RATE = 24e3;
+const BYTES_PER_SECOND = SAMPLE_RATE * 2;
+const SEGMENT_SECONDS = 10;
+function wavHeader(bytes) {
+  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes % 2 || bytes > 4294967295 - 36)
+    throw new Error("Invalid PCM size");
+  const b = Buffer.alloc(44);
+  b.write("RIFF", 0);
+  b.writeUInt32LE(bytes + 36, 4);
+  b.write("WAVEfmt ", 8);
+  b.writeUInt32LE(16, 16);
+  b.writeUInt16LE(1, 20);
+  b.writeUInt16LE(1, 22);
+  b.writeUInt32LE(SAMPLE_RATE, 24);
+  b.writeUInt32LE(BYTES_PER_SECOND, 28);
+  b.writeUInt16LE(2, 32);
+  b.writeUInt16LE(16, 34);
+  b.write("data", 36);
+  b.writeUInt32LE(bytes, 40);
+  return b;
+}
+const FRAME_MS = 20;
+const BYTES_PER_MS = 48;
+const FRAME_BYTES = FRAME_MS * BYTES_PER_MS;
+const SILENT_DB = -100;
+function samples(pcm) {
+  const length = pcm.length >> 1;
+  if (pcm.byteOffset % 2 === 0) return new Int16Array(pcm.buffer, pcm.byteOffset, length);
+  const copy = new Int16Array(length);
+  for (let index = 0; index < length; index++) copy[index] = pcm.readInt16LE(index * 2);
+  return copy;
+}
+function rmsDb(view, from, to) {
+  if (to <= from) return SILENT_DB;
+  let sum = 0;
+  for (let index = from; index < to; index++) sum += view[index] * view[index];
+  const rms = Math.sqrt(sum / (to - from));
+  return rms <= 0 ? SILENT_DB : Math.max(SILENT_DB, 20 * Math.log10(rms / 32768));
+}
+function frameLevel(pcm, start = 0, end = pcm.length) {
+  return rmsDb(samples(pcm.subarray(start, end)), 0, end - start >> 1);
+}
+function frameLevels(pcm) {
+  const view = samples(pcm), perFrame = FRAME_BYTES / 2;
+  const count = Math.ceil(view.length / perFrame);
+  const levels = new Float32Array(count);
+  for (let frame = 0; frame < count; frame++)
+    levels[frame] = rmsDb(view, frame * perFrame, Math.min(view.length, (frame + 1) * perFrame));
+  return levels;
+}
+function adaptiveThreshold(levels) {
+  if (!levels.length) return -40;
+  const sorted = Float32Array.from(levels).sort();
+  const floor = sorted[Math.floor(0.2 * (sorted.length - 1))];
+  return Math.min(-30, Math.max(-50, floor + 10));
+}
+function speechStats(levels, threshold, from = 0, to = levels.length) {
+  let voiced = 0, first = -1, last = -1;
+  for (let frame = from; frame < to; frame++)
+    if (levels[frame] > threshold) {
+      voiced++;
+      if (first < 0) first = frame;
+      last = frame;
+    }
+  return { voicedMs: voiced * FRAME_MS, firstVoicedFrame: first, lastVoicedFrame: last };
+}
+class SilenceTracker {
+  floorDb = null;
+  trailingSilentMs = 0;
+  turnVoicedMs = 0;
+  firstVoicedByte = null;
+  lastVoicedByte = null;
+  remainder = Buffer.alloc(0);
+  remainderStart = 0;
+  get threshold() {
+    return Math.min(-30, Math.max(-50, (this.floorDb ?? -60) + 10));
+  }
+  push(pcm, offset) {
+    let data = pcm, start = offset;
+    if (this.remainder.length && this.remainderStart + this.remainder.length === offset) {
+      data = Buffer.concat([this.remainder, pcm]);
+      start = this.remainderStart;
+    }
+    let index = 0;
+    for (; index + FRAME_BYTES <= data.length; index += FRAME_BYTES)
+      this.frame(frameLevel(data, index, index + FRAME_BYTES), start + index);
+    this.remainder = Buffer.from(data.subarray(index));
+    this.remainderStart = start + index;
+  }
+  frame(level, byte) {
+    if (this.floorDb === null || level < this.floorDb) this.floorDb = level;
+    else this.floorDb = Math.min(level, this.floorDb + 0.5 * FRAME_MS / 1e3);
+    if (level > this.threshold) {
+      this.trailingSilentMs = 0;
+      this.turnVoicedMs += FRAME_MS;
+      this.firstVoicedByte ??= byte;
+      this.lastVoicedByte = byte + FRAME_BYTES;
+    } else this.trailingSilentMs += FRAME_MS;
+  }
+  /** Starts a new turn; the noise floor and the trailing-silence run carry over. */
+  resetTurn() {
+    this.turnVoicedMs = 0;
+    this.firstVoicedByte = null;
+    this.lastVoicedByte = null;
+  }
+}
+function shouldCommit(turnMs, trailingSilentMs) {
+  return turnMs >= 6e3 && trailingSilentMs >= 500 || turnMs >= 2e4 && trailingSilentMs >= 250 || turnMs >= 4e4 && trailingSilentMs >= 100 || turnMs >= 9e4;
+}
+function cutAllowed(detachedMs, trailingSilentMs) {
+  return trailingSilentMs >= 300 || detachedMs >= 5 * 6e4 && trailingSilentMs >= 100 || detachedMs >= 15 * 6e4;
+}
+function planChunks(levels, baseByte, options = {}) {
+  const o = { targetMs: 18e4, maxMs: 285e3, minPauseMs: 250, padMs: 300, minVoicedMs: 400, ...options };
+  const count = levels.length;
+  const totalBytes = o.totalBytes ?? count * FRAME_BYTES;
+  if (!count || totalBytes <= 0) return [];
+  const threshold = o.threshold ?? adaptiveThreshold(levels);
+  const target = Math.round(o.targetMs / FRAME_MS), max = Math.max(1, Math.round(o.maxMs / FRAME_MS)), minPause = Math.max(1, Math.ceil(o.minPauseMs / FRAME_MS)), pad2 = Math.round(o.padMs / FRAME_MS);
+  const midpoints = [];
+  let run = 0;
+  for (let frame = 0; frame <= count; frame++) {
+    if (frame < count && !(levels[frame] > threshold)) {
+      run++;
+      continue;
+    }
+    if (run >= minPause) midpoints.push(frame - Math.floor(run / 2));
+    run = 0;
+  }
+  const bounds = [0];
+  let cursor = 0;
+  while (count - cursor > max) {
+    const low = cursor + Math.ceil(target / 2), high = cursor + max, goal = cursor + target;
+    let best = -1;
+    for (const mid of midpoints)
+      if (mid >= low && mid <= high && (best < 0 || Math.abs(mid - goal) < Math.abs(best - goal))) best = mid;
+    if (best < 0) {
+      for (let frame = Math.max(cursor + 1, high - 1500); frame < high; frame++)
+        if (best < 0 || levels[frame] < levels[best]) best = frame;
+    }
+    bounds.push(best);
+    cursor = best;
+  }
+  bounds.push(count);
+  const end = baseByte + totalBytes;
+  const chunks = [];
+  for (let index = 0; index + 1 < bounds.length; index++) {
+    const from = bounds[index], to = bounds[index + 1];
+    const stats = speechStats(levels, threshold, from, to);
+    const silent = stats.voicedMs < o.minVoicedMs;
+    const first = silent ? from : Math.max(from, stats.firstVoicedFrame - pad2), last = silent ? to : Math.min(to, stats.lastVoicedFrame + 1 + pad2);
+    const startByte = Math.min(end, baseByte + first * FRAME_BYTES), endByte = Math.min(end, baseByte + last * FRAME_BYTES);
+    if (endByte > startByte) chunks.push({ startByte, endByte, silent, voicedMs: stats.voicedMs });
+  }
+  return chunks;
+}
+const bytesAt = (seconds) => Math.round(seconds * (BYTES_PER_SECOND / 2)) * 2;
+const secondsAt = (bytes) => bytes / BYTES_PER_SECOND;
+function byteSpan(segment) {
+  return { startByte: bytesAt(segment.start), endByte: bytesAt(segment.end) };
+}
+function audioEnd(segments) {
+  return Math.max(0, ...segments.filter((s) => s.path).map((s) => byteSpan(s).endByte));
+}
+async function wavDataOffset(file) {
+  const handle = await promises.open(file, "r");
+  try {
+    const size = (await handle.stat()).size;
+    const header = Buffer.alloc(Math.min(size, 64 * 1024));
+    await handle.read(header, 0, header.length, 0);
+    if (header.length < 12 || header.toString("ascii", 0, 4) !== "RIFF" || header.toString("ascii", 8, 12) !== "WAVE")
+      throw new Error("Not a WAV file");
+    let cursor = 12;
+    while (cursor + 8 <= header.length) {
+      const length = header.readUInt32LE(cursor + 4);
+      if (header.toString("ascii", cursor, cursor + 4) === "data")
+        return { offset: cursor + 8, bytes: Math.max(0, Math.min(length, size - cursor - 8)) };
+      cursor += 8 + length + length % 2;
+    }
+    throw new Error("WAV data chunk not found");
+  } finally {
+    await handle.close();
+  }
+}
+async function readRange(segments, startByte, endByte, cache = /* @__PURE__ */ new Map()) {
+  const result = Buffer.alloc(Math.max(0, endByte - startByte));
+  for (const segment of segments) {
+    if (!segment.path) continue;
+    const span = byteSpan(segment);
+    const from = Math.max(startByte, span.startByte), to = Math.min(endByte, span.endByte);
+    if (to <= from) continue;
+    let info = cache.get(segment.path);
+    try {
+      if (!info) {
+        info = await wavDataOffset(segment.path);
+        cache.set(segment.path, info);
+      }
+      const position = from - span.startByte;
+      const length = Math.min(to - from, info.bytes - position);
+      if (length <= 0) continue;
+      const handle = await promises.open(segment.path, "r");
+      try {
+        let read = 0;
+        while (read < length) {
+          const { bytesRead } = await handle.read(
+            result,
+            from - startByte + read,
+            length - read,
+            info.offset + position + read
+          );
+          if (!bytesRead) break;
+          read += bytesRead;
+        }
+      } finally {
+        await handle.close();
+      }
+    } catch (error) {
+      throw new Error(
+        `Saved audio could not be read (${error instanceof Error ? error.message : "unknown error"}).`
+      );
+    }
+  }
+  return result;
+}
+async function scanLevels(segments, startByte, endByte) {
+  const total = Math.max(0, endByte - startByte);
+  const levels = new Float32Array(Math.ceil(total / FRAME_BYTES));
+  const block = FRAME_BYTES * 1092;
+  const cache = /* @__PURE__ */ new Map();
+  for (let offset = 0; offset < total; offset += block) {
+    const pcm = await readRange(segments, startByte + offset, startByte + Math.min(total, offset + block), cache);
+    levels.set(frameLevels(pcm), offset / FRAME_BYTES);
+  }
+  return levels;
+}
+const pcmWav = (pcm) => Buffer.concat([wavHeader(pcm.length - pcm.length % 2), pcm.subarray(0, pcm.length - pcm.length % 2)]);
 const require$1 = node_module.createRequire(typeof __filename === "string" ? __filename : require("url").pathToFileURL(__filename).href);
 function installedModule(specifier) {
   const resolved = require$1.resolve(specifier), physical = resolved.replace(/app\.asar([/\\])/, "app.asar.unpacked$1");
@@ -724,7 +1211,7 @@ class MaterialService {
     const destination = path.join(directory, `original${extension}`);
     try {
       await node_fs.promises.mkdir(directory, { recursive: true });
-      await promises.pipeline(
+      await promises$1.pipeline(
         node_fs.createReadStream(source),
         node_fs.createWriteStream(`${destination}.part`, { flags: "wx", mode: 384 })
       );
@@ -771,7 +1258,7 @@ class MaterialService {
   }
   ocrLanguages() {
     const language2 = this.store.settings().lectureLanguage;
-    return language2 === "auto" ? ["eng", "rus", "ukr", "pol"] : [{ en: "eng", ru: "rus", uk: "ukr", pl: "pol" }[language2]];
+    return [.../* @__PURE__ */ new Set([{ en: "eng", ru: "rus", uk: "ukr", pl: "pol" }[language2], "eng"])];
   }
   async extract(material) {
     try {
@@ -843,7 +1330,7 @@ class MaterialService {
           ocrWorker: installedModule("tesseract.js/src/worker-script/node/index.js")
         }
       });
-      let finished = false;
+      let finished2 = false;
       worker.on("message", (message) => {
         if (message.progress !== void 0)
           this.emit({
@@ -853,20 +1340,20 @@ class MaterialService {
             message: material.name
           });
         if (message.pages) {
-          finished = true;
+          finished2 = true;
           resolve(message.pages);
         }
         if (message.error) {
-          finished = true;
+          finished2 = true;
           reject(new Error(message.error));
         }
       });
       worker.on("error", (error) => {
-        finished = true;
+        finished2 = true;
         reject(error);
       });
       worker.on("exit", (code) => {
-        if (!finished) reject(new Error(`PDF worker exited before completing (${code})`));
+        if (!finished2) reject(new Error(`PDF worker exited before completing (${code})`));
       });
     });
   }
@@ -919,23 +1406,10 @@ class MaterialService {
     const segments = [];
     for (const file of files) {
       const filename = path.join(directory, file);
-      const stat = await node_fs.promises.stat(filename);
-      const handle = await node_fs.promises.open(filename, "r");
-      const header = Buffer.alloc(Math.min(stat.size, 64 * 1024));
-      try {
-        await handle.read(header, 0, header.length, 0);
-      } finally {
-        await handle.close();
-      }
-      let cursor = 12, bytes = 0;
-      while (cursor + 8 <= header.length) {
-        const size = header.readUInt32LE(cursor + 4);
-        if (header.toString("ascii", cursor, cursor + 4) === "data") {
-          bytes = size;
-          break;
-        }
-        cursor += 8 + size + size % 2;
-      }
+      const bytes = await wavDataOffset(filename).then(
+        (info) => info.bytes,
+        () => 0
+      );
       if (!bytes || bytes / 48e3 > 301) throw new Error("Invalid converted audio segment");
       const duration = bytes / 48e3;
       segments.push({
@@ -963,6 +1437,7 @@ class MaterialService {
 const tableNames = [
   "subjects",
   "lectures",
+  "transcript_items",
   "segments",
   "versions",
   "materials",
@@ -988,6 +1463,20 @@ const columns = {
     "createdAt",
     "deletedAt",
     "activeVersionId"
+  ],
+  transcript_items: [
+    "id",
+    "lectureId",
+    "start",
+    "end",
+    "text",
+    "status",
+    "source",
+    "model",
+    "language",
+    "error",
+    "sourceKey",
+    "createdAt"
   ],
   segments: ["id", "lectureId", "sequence", "start", "end", "path", "text", "status", "error"],
   versions: [
@@ -1096,7 +1585,7 @@ async function readArchive(filename, stage) {
               (done, streamReject) => zip.openReadStream(entry, (streamError, stream) => {
                 if (streamError || !stream)
                   return streamReject(streamError || new Error("Invalid archive entry"));
-                promises.pipeline(stream, node_fs.createWriteStream(destination, { flags: "wx", mode: 384 })).then(
+                promises$1.pipeline(stream, node_fs.createWriteStream(destination, { flags: "wx", mode: 384 })).then(
                   () => done(),
                   streamReject
                 );
@@ -1146,7 +1635,9 @@ async function walkFiles(root, relative = "") {
   return result;
 }
 function validateData(data, entries) {
-  if (data.schema !== 1 || !["lecture", "backup"].includes(data.kind) || !data.tables || typeof data.createdAt !== "string" || !Number.isFinite(Date.parse(data.createdAt)))
+  if (data && data.schema === 1 && data.tables && typeof data.tables === "object")
+    data.tables.transcript_items ??= [];
+  if (data.schema !== 1 && data.schema !== 2 || !["lecture", "backup"].includes(data.kind) || !data.tables || typeof data.createdAt !== "string" || !Number.isFinite(Date.parse(data.createdAt)))
     throw new Error("Invalid archive data");
   const ids = /* @__PURE__ */ new Set();
   for (const table of tableNames) {
@@ -1170,10 +1661,17 @@ function validateData(data, entries) {
   const lectures = new Set(data.tables.lectures.map((row) => row.id));
   const versions = new Map(data.tables.versions.map((row) => [row.id, row]));
   const conversations = new Set(data.tables.conversations.map((row) => row.id));
-  for (const table of ["segments", "versions", "materials", "gaps", "usage", "tasks"])
+  for (const table of ["transcript_items", "segments", "versions", "materials", "gaps", "usage", "tasks"])
     for (const row of data.tables[table])
       if (row.lectureId && !lectures.has(row.lectureId))
         throw new Error("Archive references a missing lecture");
+  const itemKeys = /* @__PURE__ */ new Set();
+  for (const row of data.tables.transcript_items) {
+    const key = `${row.lectureId}:${row.sourceKey}`;
+    if (!row.lectureId || typeof row.sourceKey !== "string" || typeof row.text !== "string" || typeof row.start !== "number" || typeof row.end !== "number" || row.end < row.start || !["done", "rejected"].includes(row.status) || itemKeys.has(key))
+      throw new Error("Invalid transcript item");
+    itemKeys.add(key);
+  }
   for (const row of [...data.tables.lectures, ...data.tables.materials])
     if (row.subjectId && !subjects.has(row.subjectId))
       throw new Error("Archive references a missing subject");
@@ -1241,7 +1739,7 @@ class Portability {
         const source = await checkedLibraryAsset(this.store, original[0].path);
         await atomicFile(
           destination,
-          (temporary) => promises.pipeline(node_fs.createReadStream(source), node_fs.createWriteStream(temporary))
+          (temporary) => promises$1.pipeline(node_fs.createReadStream(source), node_fs.createWriteStream(temporary))
         );
       } else {
         const stage = await node_fs.promises.mkdtemp(path.join(os.tmpdir(), "lecturedesk-audio-"));
@@ -1295,7 +1793,7 @@ class Portability {
       }
       const doc = new docx.Document({ sections: [{ children: paragraphs }] });
       await atomicFile(destination, async (temporary) => {
-        await promises.pipeline(docx.Packer.toStream(doc), node_fs.createWriteStream(temporary));
+        await promises$1.pipeline(docx.Packer.toStream(doc), node_fs.createWriteStream(temporary));
       });
     } else if (format === "pdf") {
       const font = await resourceFile("fonts/NotoSans-Regular.ttf");
@@ -1412,7 +1910,10 @@ class Portability {
         "lectureIds",
         "materialIds",
         "segmentIds",
-        "coverageSegmentIds"
+        "coverageSegmentIds",
+        "itemId",
+        "itemIds",
+        "coverageItemIds"
       ]);
       const mapReferences = (value, key = "") => {
         if (typeof value === "string") return referenceNames.has(key) ? ids.get(value) || value : value;
@@ -1455,6 +1956,19 @@ class Portability {
                 row.status = "cancelled";
                 row.error = "Audio was excluded from this backup";
               }
+              const readsAudio = row.kind === "transcribe-range" || row.kind === "improve" && payload.mode === "range";
+              if (readsAudio) {
+                if (payload.livePending) row.payload = { ...payload, livePending: false };
+                if (row.status !== "done" && row.status !== "cancelled") row.nextRun = 0;
+                if (!data.audioIncluded && row.status !== "done") {
+                  row.status = "cancelled";
+                  row.error = "Audio was excluded from this backup";
+                }
+              }
+            }
+            if (table === "transcript_items") {
+              const match = /^range:([^:]+):(\d+)$/.exec(String(row.sourceKey));
+              if (match && ids.has(match[1])) row.sourceKey = `range:${ids.get(match[1])}:${match[2]}`;
             }
             const names = columns[table];
             this.store.db.prepare(`INSERT INTO ${table} (${names.join(",")}) VALUES (${names.map(() => "?").join(",")})`).run(
@@ -1498,7 +2012,7 @@ class Portability {
         if (!lecture) throw new Error("Lecture does not exist");
         tables.lectures = [lecture];
         tables.subjects = tables.subjects.filter((subject) => subject.id === lecture.subjectId);
-        for (const table of ["segments", "versions", "gaps", "usage", "tasks"])
+        for (const table of ["transcript_items", "segments", "versions", "gaps", "usage", "tasks"])
           tables[table] = tables[table].filter(
             (item) => item.lectureId === lectureId2
           );
@@ -1550,7 +2064,7 @@ class Portability {
           item.path = member;
         }
       const data = {
-        schema: 1,
+        schema: 2,
         kind: lectureId2 ? "lecture" : "backup",
         createdAt: (/* @__PURE__ */ new Date()).toISOString(),
         audioIncluded: includeAudio,
@@ -1597,6 +2111,48 @@ class Portability {
     }
   }
 }
+function timeLabel(seconds) {
+  const value = Math.max(0, Math.floor(seconds));
+  return value >= 3600 ? `${Math.floor(value / 3600)}:${String(Math.floor(value % 3600 / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}` : `${Math.floor(value / 60)}:${String(value % 60).padStart(2, "0")}`;
+}
+function transcriptUnits(segments, items = [], options = {}) {
+  const units = [];
+  for (const segment of segments)
+    if (segment.status === "done" && segment.text)
+      units.push({
+        id: segment.id,
+        start: segment.start,
+        end: segment.end,
+        text: segment.text,
+        kind: "segment",
+        status: "done",
+        order: `0:${String(segment.sequence).padStart(12, "0")}`
+      });
+  for (const item of items)
+    if (item.status === "done" ? Boolean(item.text) : options.includeRejected)
+      units.push({
+        id: item.id,
+        start: item.start,
+        end: item.end,
+        text: item.text,
+        kind: "item",
+        status: item.status,
+        error: item.error,
+        order: `1:${item.sourceKey}`
+      });
+  return units.sort((a, b) => a.start - b.start || (a.order < b.order ? -1 : a.order > b.order ? 1 : 0));
+}
+function renderTranscript(units) {
+  return units.filter((unit) => unit.status === "done").map((unit) => `[${timeLabel(unit.start)}] ${unit.text}`).join("\n\n");
+}
+function finalizedUnits(units, frontierSeconds) {
+  return units.filter((unit) => unit.status === "done" && unit.end <= frontierSeconds + 1e-9);
+}
+function turnPolicy(model) {
+  return ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"].some(
+    (base) => model === base || model.startsWith(`${base}-`)
+  ) ? "server" : "local";
+}
 class APIError extends Error {
   constructor(message, status = 0, code = "", retryAfter = 0) {
     super(message);
@@ -1614,17 +2170,60 @@ const createRealtimeSocket = (key) => new WebSocket("wss://api.openai.com/v1/rea
   handshakeTimeout: 12e3,
   maxPayload: 2 * 1024 * 1024
 });
-function transcriptionSettings(model, language2, glossary, realtime = false) {
+const SETTING = {
+  pl: {
+    lecture: "Wykład uniwersytecki po polsku.",
+    english: "Mogą pojawiać się angielskie terminy.",
+    terms: "Terminy:"
+  },
+  ru: {
+    lecture: "Университетская лекция на русском языке.",
+    english: "Могут встречаться английские термины.",
+    terms: "Термины:"
+  },
+  uk: {
+    lecture: "Університетська лекція українською мовою.",
+    english: "Можуть траплятися англійські терміни.",
+    terms: "Терміни:"
+  },
+  en: { lecture: "University lecture in English.", english: "", terms: "Terms:" }
+};
+const family = (model, bases) => bases.some((base) => model === base || model.startsWith(`${base}-`));
+const usesLanguages = (model) => family(model, ["gpt-live-transcribe", "gpt-transcribe"]);
+function transcriptionSettings(model, language2, glossary, realtime = false, strict = false, context2 = "") {
   const settings = { model };
-  const clean = glossary.replace(/[<>\r]/g, " ").slice(0, model === "whisper-1" ? 650 : 2e3);
-  if (clean.trim()) settings.prompt = `Vocabulary that may occur in this lecture: ${clean}`;
-  if (model === "gpt-transcribe" || model === "gpt-live-transcribe") {
-    if (language2 !== "auto") settings.languages = [language2];
+  const setting = SETTING[language2];
+  const clean = glossary.replace(/[<>\r]/g, " ").trim();
+  const limit = model === "whisper-1" ? 650 : 1800;
+  const header = [setting.lecture, !strict && language2 !== "en" ? setting.english : ""].filter(Boolean).join(" ");
+  const vocabulary = clean ? `
+${setting.terms} ${clean.slice(0, model === "whisper-1" ? 300 : 900)}` : "";
+  const previous = !strict && context2.trim() ? `
+${context2.trim().slice(-700)}` : "";
+  settings.prompt = `${header}${vocabulary}${previous}`.slice(0, limit);
+  if (usesLanguages(model)) {
+    settings.languages = strict || language2 === "en" ? [language2] : [language2, "en"];
     const keywords = clean.split(/[,;\n]/).map((x) => x.trim()).filter(Boolean).slice(0, 60);
     if (keywords.length) settings.keywords = keywords;
-    if (realtime && model === "gpt-live-transcribe") settings.delay = "medium";
-  } else if (language2 !== "auto") settings.language = language2;
+    if (realtime && family(model, ["gpt-live-transcribe"])) settings.delay = "medium";
+  } else settings.language = language2;
   return settings;
+}
+function realtimeSession(model, language2, glossary, policy, vadVariant = "semantic", eventId) {
+  return {
+    type: "session.update",
+    ...eventId ? { event_id: eventId } : {},
+    session: {
+      type: "transcription",
+      audio: {
+        input: {
+          format: { type: "audio/pcm", rate: 24e3 },
+          transcription: transcriptionSettings(model, language2, glossary, true),
+          turn_detection: policy === "local" ? null : vadVariant === "semantic" ? { type: "semantic_vad", eagerness: "low" } : { type: "server_vad", threshold: 0.5, prefix_padding_ms: 300, silence_duration_ms: 700 }
+        }
+      }
+    }
+  };
 }
 class OpenAIProvider {
   constructor(getKey, fetcher = fetch) {
@@ -1709,8 +2308,15 @@ class OpenAIProvider {
     };
   }
   async transcribe(request, signal) {
-    const info = await promises$1.stat(request.path);
-    if (info.size > 25 * 1024 * 1024)
+    if (!request.audio && request.path && (await promises.stat(request.path)).size > 25 * 1024 * 1024)
+      throw new APIError(
+        "Audio segment exceeds the 25 MB transcription limit. Import it again so it can be split.",
+        400,
+        "audio_too_large"
+      );
+    const audio = request.audio ?? (request.path ? await promises.readFile(request.path) : void 0);
+    if (!audio) throw new APIError("No audio was supplied for transcription.", 400, "missing_audio");
+    if (audio.length > 25 * 1024 * 1024)
       throw new APIError(
         "Audio segment exceeds the 25 MB transcription limit. Import it again so it can be split.",
         400,
@@ -1719,25 +2325,21 @@ class OpenAIProvider {
     const form = new FormData();
     form.set(
       "file",
-      new Blob([new Uint8Array(await promises$1.readFile(request.path))], { type: "audio/wav" }),
-      path.basename(request.path)
+      new Blob([new Uint8Array(audio)], { type: "audio/wav" }),
+      request.path ? path.basename(request.path) : "lecture-audio.wav"
     );
     for (const [key, value] of Object.entries(
-      transcriptionSettings(request.model, request.language, request.glossary)
+      transcriptionSettings(
+        request.model,
+        request.language,
+        request.glossary,
+        false,
+        request.strict,
+        request.context
+      )
     )) {
       if (Array.isArray(value)) for (const item of value) form.append(`${key}[]`, String(item));
       else form.set(key, String(value));
-    }
-    if (request.context.trim()) {
-      const previous = request.context.slice(-700);
-      form.set(
-        "prompt",
-        `Vocabulary: ${request.glossary.slice(0, 900)}
-Previous audio transcript, context only: ${previous}`.slice(
-          0,
-          request.model === "whisper-1" ? 650 : 1800
-        )
-      );
     }
     if (request.model === "whisper-1") {
       form.set("response_format", "verbose_json");
@@ -1752,20 +2354,8 @@ Previous audio transcript, context only: ${previous}`.slice(
 const words = (text2) => text2.match(/[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu)?.length ?? 0;
 const sentenceComplete = (text2) => /[.!?…。！？][\s\p{Pe}"'»”]*$/u.test(text2.trim());
 const digest = (data) => node_crypto.createHash("sha256").update(JSON.stringify(data)).digest("hex");
-function timeLabel(seconds) {
-  const value = Math.max(0, Math.floor(seconds));
-  return value >= 3600 ? `${Math.floor(value / 3600)}:${String(Math.floor(value % 3600 / 60)).padStart(2, "0")}:${String(value % 60).padStart(2, "0")}` : `${Math.floor(value / 60)}:${String(value % 60).padStart(2, "0")}`;
-}
-function orderedTranscript(segments) {
-  return [...segments].sort((a, b) => a.sequence - b.sequence).filter((s) => s.status === "done").map((s) => `[${timeLabel(s.start)}] ${s.text}`).join("\n\n");
-}
-function finalizedPrefix(segments) {
-  const result = [];
-  for (const segment of [...segments].sort((a, b) => a.sequence - b.sequence)) {
-    if (segment.status !== "done") break;
-    result.push(segment);
-  }
-  return result;
+function orderedTranscript(segments, items = []) {
+  return renderTranscript(transcriptUnits(segments, items));
 }
 function textSections(text2, limit = 14e3) {
   const chunks = [];
@@ -1861,7 +2451,7 @@ class LocalRetrieval {
       const detail = this.store.lectureGet(lectureId2);
       const version = detail.versions.find((v) => v.id === detail.lecture.activeVersionId) ?? detail.versions.find((v) => v.kind === "original");
       const key = `lecture:${lectureId2}`, title = detail.lecture.title;
-      const content = version?.content ?? orderedTranscript(detail.segments);
+      const content = version?.content ?? orderedTranscript(detail.segments, detail.items);
       const chunks = textSections(content, 2600);
       const passages = chunks.map((text2, index) => {
         const stamp = text2.match(/\[(?:(\d+):)?(\d+):(\d+)\]/);
@@ -1934,8 +2524,323 @@ ${p.text}`).join("\n\n");
 const requestsSummary = (text2) => /summari[sz]|summary|overview|synthesi[sz]|detailed notes|конспект|резюм|обобщ|підсум|підб.*підсум|streszcz|podsum/iu.test(
   text2
 );
+const SILENCE_HALLUCINATIONS = [
+  /продолжение следует/g,
+  /субтитры (?:сделал|создавал|создал|подготовил)(?: \S+)? ?dimatorzok/g,
+  /редактор субтитров(?: [а-яa-z]{1,3}\s?[а-яa-z]+)?/g,
+  /корректор(?: [а-яa-z]{1,3})? ?егорова/g,
+  /спасибо за просмотр/g,
+  /подписывайтесь на (?:наш )?канал/g,
+  /дякую за перегляд/g,
+  /thanks? (?:you )?for watching/g,
+  /please subscribe(?: to (?:my|our|the) channel)?/g,
+  /subscribe to (?:my|our|the) channel/g,
+  /napisy stworzone przez społeczność amara ?org/g,
+  /字幕由 ?amara ?org ?社[区區]提供/g,
+  /請不吝點贊 ?訂閱(?: ?轉發 ?打賞支持明鏡與點點欄目)?/g,
+  /请不吝点赞 ?订阅/g,
+  /mbc ?뉴스(?: [가-힣]+)?/g,
+  // German, Spanish, French, Italian, Portuguese and Dutch subtitle credits (ZDF/funk, Amara.org).
+  /untertitel(?:ung)?(?: im auftrag)? (?:des|vom) zdf(?: für funk)?(?: \d{4})?/g,
+  /untertitel(?:ung)? der amara ?org ?community/g,
+  /untertitel von stephanie geiges/g,
+  /subt[ií]tulos (?:realizados )?por la comunidad de amara ?org/g,
+  /sous titres? (?:réalisés )?(?:par|pour) la communauté d ?amara ?org/g,
+  /sous titrage (?:st 501|société radio canada)/g,
+  /sottotitoli (?:creati )?dalla comunit[àa] (?:di )?amara ?org/g,
+  /sottotitoli e revisione a cura di qtss/g,
+  /legendas pela comunidade (?:de )?amara ?org/g,
+  /ondertiteling door de amara ?org gemeenschap/g,
+  // Any short credit naming Amara.org (never said in a lecture).
+  new RegExp("(?:\\p{L}+ ){0,6}amara ?org(?: \\p{L}+){0,2}", "gu")
+];
+const LATIN_PROFILES = {
+  en: {
+    words: new Set(
+      "the and of is that this with are it for be were can which from have has not or but you they these there what its their our would should about into than then when how been more some will".split(
+        " "
+      )
+    ),
+    letters: /(?:tion|ing|ness)\b/g
+  },
+  pl: {
+    words: new Set(
+      "się nie jest że oraz który która które którzy dla przez jako czy są być może tym jak też już więc gdzie tylko bardzo jeszcze można także żeby".split(
+        " "
+      )
+    ),
+    letters: /[ąćęłńóśźż]/g
+  },
+  de: {
+    words: new Set(
+      "der die das und ist nicht ein eine einen mit den dem des von für auf auch sich wir zu im sie wird werden oder aber wenn dass heute über".split(
+        " "
+      )
+    ),
+    letters: /[äöüß]/g
+  },
+  es: {
+    words: new Set(
+      "el los las del que y por con una es se lo como más pero sus su este esta hoy vamos muy también al".split(" ")
+    ),
+    letters: /[ñ¿¡áíú]/g
+  },
+  fr: {
+    words: new Set(
+      "le les des et est une du qui dans pour pas sur avec nous vous ce cette sont au aux aujourd hui".split(" ")
+    ),
+    letters: /[çàèùâêîûëïœ]/g
+  },
+  it: {
+    words: new Set("il gli di che è della delle dei sono questo questa anche nel nella alla oggi".split(" ")),
+    letters: /[àèìòù]/g
+  },
+  pt: {
+    words: new Set("os das dos em uma que não com por mais é são pela pelo também muito você isso hoje".split(" ")),
+    letters: /[ãõçâêô]/g
+  },
+  cs: {
+    words: new Set("jsou není také který která které tento toto pro při podle jsem jsme byl bylo že".split(" ")),
+    letters: /[řěůčšžý]/g
+  },
+  sk: {
+    words: new Set("sú sa ako aj ktorý ktorá ktoré pre pri podľa tento táto toto som sme bol bolo že".split(" ")),
+    letters: /[ľĺŕäôčšžý]/g
+  }
+};
+const LATIN_NAMES = {
+  en: "English",
+  pl: "Polish",
+  de: "German",
+  es: "Spanish",
+  fr: "French",
+  it: "Italian",
+  pt: "Portuguese",
+  cs: "Czech",
+  sk: "Slovak"
+};
+const UKRAINIAN_WORDS = new Set(
+  "що це ця цей ці як також дуже отже який яка яке які щоб бо він вона вони від зі із лише чи".split(" ")
+);
+const RUSSIAN_WORDS = new Set(
+  "что как который которая которые которое был была было были если чтобы только очень нет можно нужно он она они его сейчас".split(
+    " "
+  )
+);
+const BULGARIAN_WORDS = new Set(
+  "са във със това които който която което днес тук нещо защото също сме сте съм тези този тази трябва обаче тъй вече кога бъде е".split(
+    " "
+  )
+);
+const LANGUAGE_NAMES$1 = { ru: "Russian", uk: "Ukrainian", en: "English", pl: "Polish" };
+const languageName = (language2) => LANGUAGE_NAMES$1[language2];
+function normalizeTranscript(text2) {
+  return text2.normalize("NFKC").toLocaleLowerCase().replace(/ё/g, "е").replace(/[^\p{L}\p{N}\s]+/gu, " ").replace(/\s+/g, " ").trim();
+}
+const tokensOf = (text2) => text2.toLocaleLowerCase().match(new RegExp("\\p{L}+", "gu")) ?? [];
+function latinScores(text2) {
+  const lower = text2.toLocaleLowerCase();
+  const tokens = tokensOf(lower);
+  const scores = {};
+  for (const [code, profile] of Object.entries(LATIN_PROFILES))
+    scores[code] = 2 * tokens.filter((token) => profile.words.has(token)).length + (lower.match(profile.letters)?.length ?? 0);
+  return scores;
+}
+function latinGuess(text2) {
+  const ranked = Object.entries(latinScores(text2)).sort((a, b) => b[1] - a[1]);
+  const [best, score] = ranked[0];
+  const second = ranked[1][1];
+  if (score < 2 || score === second) return { language: "unknown", confident: false, score };
+  return { language: best, confident: score >= 4 && score >= 2 * second + 2, score };
+}
+function foreignLatin(text2, allowed) {
+  const scores = latinScores(text2);
+  const allowedScore = allowed.reduce((sum, code) => sum + scores[code], 0);
+  const [language2, score] = Object.entries(scores).filter(([code]) => !allowed.includes(code)).sort((a, b) => b[1] - a[1])[0];
+  return { language: language2, score, allowedScore };
+}
+function cyrillicScores(text2) {
+  const lower = text2.toLocaleLowerCase();
+  const tokens = tokensOf(lower);
+  const count = (words2) => tokens.filter((token) => words2.has(token)).length;
+  const letters = (pattern) => lower.match(pattern)?.length ?? 0;
+  return {
+    uk: 2 * letters(/[іїєґ]/g) + 2 * count(UKRAINIAN_WORDS),
+    // Russian ъ only separates (объём); as a vowel it is Bulgarian (във, със, път).
+    ru: 2 * letters(/[ыэё]/g) + 2 * letters(/ъ(?=[еёюя])/g) + 2 * count(RUSSIAN_WORDS),
+    bg: 2 * letters(/ъ(?![еёюя])/g) + 2 * count(BULGARIAN_WORDS)
+  };
+}
+function detectedCodes(detected) {
+  if (!Array.isArray(detected)) return [];
+  return detected.map(
+    (value) => typeof value === "string" ? value : value && typeof value === "object" && "code" in value ? String(value.code) : ""
+  ).map((code) => code.toLowerCase().split(/[-_]/)[0]).filter(Boolean);
+}
+function checkTranscript(text2, language2, options = {}) {
+  const letters = text2.match(new RegExp("\\p{L}", "gu")) ?? [];
+  if (!letters.length) return { status: "silent", reason: "no-letters" };
+  const normalized = normalizeTranscript(text2);
+  const compact = normalized.replace(/\s/g, "");
+  let rest = normalized;
+  for (const pattern of SILENCE_HALLUCINATIONS) rest = rest.replace(pattern, " ");
+  const remaining = rest.replace(/\s/g, "").length;
+  if (compact.length && (compact.length - remaining) / compact.length >= 0.8)
+    return { status: "silent", reason: "hallucination" };
+  const tokens = normalized.split(" ").filter(Boolean);
+  for (let index = 0, run = 1; index < tokens.length; index++) {
+    run = index && tokens[index] === tokens[index - 1] ? run + 1 : 1;
+    if (run >= 8) return { status: "reject", reason: "repetition", detail: `"${tokens[index]}" repeated` };
+  }
+  if (options.voicedMs !== void 0 && compact.length > 40) {
+    const perSecond = compact.length / Math.max(1, options.voicedMs / 1e3);
+    if (perSecond > 40)
+      return {
+        status: "reject",
+        reason: "repetition",
+        detail: `${Math.round(perSecond)} characters per second of speech`
+      };
+  }
+  let latin = 0, cyrillic = 0, greek = 0, foreign = 0;
+  for (const letter of letters) {
+    if (new RegExp("\\p{Script=Latin}", "u").test(letter)) latin++;
+    else if (new RegExp("\\p{Script=Cyrillic}", "u").test(letter)) cyrillic++;
+    else if (new RegExp("\\p{Script=Greek}", "u").test(letter)) greek++;
+    else foreign++;
+  }
+  const total = letters.length;
+  const percent = (count) => `${Math.round(count / total * 100)}%`;
+  if (foreign >= 2 && foreign / total > 0.05)
+    return { status: "reject", reason: "foreign-script", detail: `${percent(foreign)} non-Latin/Cyrillic letters` };
+  if (greek >= 2 && greek / total > 0.2)
+    return { status: "reject", reason: "foreign-script", detail: `${percent(greek)} Greek letters` };
+  if ((language2 === "pl" || language2 === "en") && cyrillic / total > 0.3)
+    return { status: "reject", reason: "wrong-alphabet", detail: `${percent(cyrillic)} Cyrillic letters` };
+  const latinWords = tokensOf(text2).filter((token) => new RegExp("\\p{Script=Latin}", "u").test(token)).length;
+  if ((language2 === "ru" || language2 === "uk") && latin / total > 0.6) {
+    const scores = latinScores(text2);
+    const other = foreignLatin(text2, ["en"]);
+    if (other.language === "pl" && other.score >= 2 && other.score > scores.en)
+      return { status: "reject", reason: "wrong-language", detail: "Polish text" };
+    if (latinWords >= 6 && other.score >= 2 && other.score > scores.en)
+      return { status: "reject", reason: "wrong-language", detail: `${LATIN_NAMES[other.language]} text` };
+  }
+  if ((language2 === "pl" || language2 === "en") && latin / total > 0.6) {
+    const allowed = language2 === "pl" ? ["pl", "en"] : ["en"];
+    const other = foreignLatin(text2, allowed);
+    const clearly = other.score >= 4 && other.score >= 2 * other.allowedScore + 2;
+    if (clearly && (latinWords >= 8 || other.language === "pl" && latinGuess(text2).confident))
+      return { status: "reject", reason: "wrong-language", detail: `${LATIN_NAMES[other.language]} text` };
+  }
+  if ((language2 === "uk" || language2 === "ru") && cyrillic >= 20) {
+    const lower = text2.toLocaleLowerCase();
+    const scores = cyrillicScores(text2);
+    const russianLetters = /[ыэъё]/.test(lower), ukrainianLetters = /[іїєґ]/.test(lower);
+    if (language2 === "uk" && !ukrainianLetters) {
+      const foreign2 = Math.max(scores.ru, scores.bg);
+      if (russianLetters || foreign2 >= 4 && foreign2 > scores.uk)
+        return {
+          status: "reject",
+          reason: "wrong-language",
+          detail: scores.bg > scores.ru ? "Bulgarian text" : "Russian text"
+        };
+    }
+    if (language2 === "ru" && ukrainianLetters && !russianLetters)
+      return { status: "reject", reason: "wrong-language", detail: "Ukrainian text" };
+    if (language2 === "ru" && scores.bg >= 4 && scores.bg > scores.ru)
+      return { status: "reject", reason: "wrong-language", detail: "Bulgarian text" };
+  }
+  const codes = detectedCodes(options.detected);
+  if (codes.length && !codes.some((code) => code === language2 || code === "en"))
+    return { status: "reject", reason: "detected-language", detail: `detected ${codes.join(", ")}` };
+  return { status: "ok" };
+}
+const MIN_GAP_BYTES = 14400;
+function mergeSpans(spans) {
+  const sorted = spans.filter((s) => s.endByte > s.startByte).sort((a, b) => a.startByte - b.startByte);
+  const merged = [];
+  for (const span of sorted) {
+    const last = merged.at(-1);
+    if (last && span.startByte <= last.endByte) last.endByte = Math.max(last.endByte, span.endByte);
+    else merged.push({ startByte: span.startByte, endByte: span.endByte });
+  }
+  return merged;
+}
+function subtractSpans(base, remove) {
+  const cuts = mergeSpans(remove);
+  const result = [];
+  for (const span of mergeSpans(base)) {
+    let cursor = span.startByte;
+    for (const cut of cuts) {
+      if (cut.endByte <= cursor || cut.startByte >= span.endByte) continue;
+      if (cut.startByte > cursor) result.push({ startByte: cursor, endByte: cut.startByte });
+      cursor = Math.max(cursor, cut.endByte);
+      if (cursor >= span.endByte) break;
+    }
+    if (cursor < span.endByte) result.push({ startByte: cursor, endByte: span.endByte });
+  }
+  return result;
+}
+const finished = (turn) => turn.status === "done" || turn.status === "silent";
+function turnFrontier(turns, startByte) {
+  let frontier = startByte;
+  for (const turn of [...turns].sort((a, b) => a.startByte - b.startByte)) {
+    if (!finished(turn) || turn.endByte === null) return Math.max(startByte, Math.min(frontier, turn.startByte));
+    frontier = Math.max(frontier, turn.endByte);
+  }
+  return frontier;
+}
+function windowGaps(turns, frontierByte, endByte) {
+  const covered = turns.filter((turn) => finished(turn) && turn.endByte !== null).map((turn) => ({ startByte: turn.startByte, endByte: turn.endByte }));
+  const strict = mergeSpans(
+    turns.filter((turn) => turn.status === "failed" && turn.strict && turn.endByte !== null).map((turn) => ({ startByte: turn.startByte, endByte: turn.endByte }))
+  );
+  const gaps = [];
+  for (const gap of subtractSpans([{ startByte: frontierByte, endByte }], covered)) {
+    if (gap.endByte - gap.startByte < MIN_GAP_BYTES) continue;
+    const plain = subtractSpans([gap], strict);
+    const strictParts = subtractSpans([gap], plain);
+    gaps.push(...plain, ...strictParts.map((part) => ({ ...part, strict: true })));
+  }
+  return gaps.sort((a, b) => a.startByte - b.startByte);
+}
+function taskSpan(task) {
+  const start = Number(task.payload.startByte ?? 0);
+  return {
+    startByte: start,
+    endByte: task.payload.endByte === null || task.payload.endByte === void 0 ? Number.POSITIVE_INFINITY : Number(task.payload.endByte)
+  };
+}
+function ensureCoverage(store2, lectureId2) {
+  const detail = store2.lectureGet(lectureId2);
+  const audio = mergeSpans(detail.segments.filter((s) => s.status === "audio" && s.path).map(byteSpan));
+  if (!audio.length) return [];
+  const covered = store2.tasks().filter((task) => task.lectureId === lectureId2 && task.kind === "transcribe-range").map(taskSpan);
+  const holes = subtractSpans(audio, covered).filter((hole) => hole.endByte - hole.startByte >= 4800);
+  if (!holes.length) return [];
+  const settings = store2.settings();
+  const glossary = detail.lecture.subjectId ? store2.db.prepare("SELECT glossary FROM subjects WHERE id=?").get(detail.lecture.subjectId)?.glossary ?? "" : "";
+  return holes.map(
+    (hole) => store2.taskAdd(
+      "transcribe-range",
+      lectureId2,
+      {
+        startByte: hole.startByte,
+        endByte: hole.endByte,
+        frontierByte: hole.startByte,
+        origin: "reconcile",
+        livePending: false,
+        model: settings.fileModel,
+        language: settings.lectureLanguage,
+        glossary
+      },
+      `range:${lectureId2}:${hole.startByte}:${hole.endByte}`
+    )
+  );
+}
 const OWN_KINDS = /* @__PURE__ */ new Set([
   "transcribe",
+  "transcribe-range",
   "action",
   "improve",
   "translation",
@@ -1944,6 +2849,10 @@ const OWN_KINDS = /* @__PURE__ */ new Set([
   "finalize",
   "chat"
 ]);
+const LANGUAGES = ["ru", "uk", "en", "pl"];
+const MINUTE = 60 * 1e3;
+const PRE_READY_LIMIT = 96e4;
+const DRAIN_MS = 45e3;
 const LANGUAGE_NAMES = {
   ru: "Russian",
   uk: "Ukrainian",
@@ -1986,6 +2895,7 @@ const ACTION_ALIASES = {
   analysis: "notes",
   "update-now": "notes"
 };
+const ms2b = (ms) => Math.round(Number(ms) * 24) * 2;
 class AIService {
   constructor(store2, getKey, emit2, options = {}) {
     this.store = store2;
@@ -2007,8 +2917,16 @@ class AIService {
   stopped = true;
   ticking = false;
   running = /* @__PURE__ */ new Map();
+  /** Settlement promises of running tasks, so deletion can wait for aborted work to stop. */
+  settling = /* @__PURE__ */ new Map();
+  /** Current realtime window per lecture. */
   live = /* @__PURE__ */ new Map();
+  /** Every window that still has a socket, pending turns or an unfinished task (incl. draining). */
   sessions = /* @__PURE__ */ new Set();
+  liveFailures = /* @__PURE__ */ new Map();
+  liveErrors = /* @__PURE__ */ new Map();
+  purging = /* @__PURE__ */ new Set();
+  hasKey = null;
   generation = 0;
   activeLectures = /* @__PURE__ */ new Set();
   waiters = /* @__PURE__ */ new Map();
@@ -2022,6 +2940,10 @@ class AIService {
         400,
         "incompatible_model"
       );
+  }
+  /** Resolves a task's language; legacy 'auto' payloads use the selected lecture language. */
+  language(value) {
+    return LANGUAGES.includes(String(value)) ? value : this.store.settings().lectureLanguage;
   }
   async validateKey(key) {
     try {
@@ -2058,6 +2980,11 @@ class AIService {
           });
         if (task.status === "error" && (task.payload.failureCode === "missing_key" || task.error?.startsWith("Connect an OpenAI API key")))
           this.store.taskUpdate(task.id, { status: "queued", nextRun: this.now(), error: null });
+        if (task.kind === "transcribe-range" && task.status === "queued" && task.payload.livePending)
+          this.store.taskUpdate(task.id, {
+            nextRun: this.now(),
+            payload: { ...task.payload, livePending: false }
+          });
         if (task.lectureId && ["queued", "running"].includes(task.status))
           this.activeLectures.add(task.lectureId);
       }
@@ -2082,21 +3009,9 @@ class AIService {
         });
       controller.abort();
     }
-    for (const state of this.sessions) {
-      state.stopped = true;
-      for (const commit of [...state.sent, ...state.items.values()]) {
-        const task = this.task(commit.taskId);
-        if (task?.status === "queued")
-          this.store.taskUpdate(task.id, {
-            nextRun: this.now(),
-            payload: { ...task.payload, livePending: false }
-          });
-      }
-      state.sent = [];
-      state.items.clear();
-      state.early.clear();
-      state.partial.clear();
-      this.closeLive(state);
+    for (const window2 of [...this.sessions]) {
+      window2.closing ??= "stop";
+      this.finalizeWindow(window2);
     }
     this.sessions.clear();
     this.live.clear();
@@ -2106,7 +3021,7 @@ class AIService {
     this.waiters.clear();
   }
   task(id2) {
-    return this.store.tasks().find((t) => t.id === id2);
+    return this.store.taskGet(id2);
   }
   cancel(taskId) {
     const task = this.task(taskId);
@@ -2119,14 +3034,57 @@ class AIService {
         status: "error",
         error: "Transcription was cancelled. The saved audio is preserved."
       });
-    this.forgetLive(taskId);
+    for (const window2 of [...this.sessions])
+      if (window2.taskId === taskId) {
+        window2.closing ??= "stop";
+        this.finalizeWindow(window2);
+      }
     this.rejectWaiters(taskId, new Error("Task cancelled."));
     this.changed(task.lectureId ?? void 0);
+  }
+  /**
+   * Cancels all queued/running AI work of a lecture, closes its realtime windows and resolves once
+   * the running requests have observed the abort (used before permanently deleting the lecture).
+   */
+  async cancelLecture(lectureId2) {
+    this.purging.add(lectureId2);
+    this.activeLectures.delete(lectureId2);
+    try {
+      await this.cancelLectureWork(lectureId2);
+    } finally {
+      this.purging.delete(lectureId2);
+    }
+  }
+  async cancelLectureWork(lectureId2) {
+    for (const task of this.store.tasks())
+      if (task.lectureId === lectureId2 && OWN_KINDS.has(task.kind) && ["queued", "running"].includes(task.status)) {
+        this.store.taskUpdate(task.id, { status: "cancelled", error: null });
+        this.running.get(task.id)?.abort();
+        this.rejectWaiters(task.id, new Error("Task cancelled."));
+      }
+    for (const window2 of [...this.sessions])
+      if (window2.lectureId === lectureId2) {
+        window2.closing ??= "stop";
+        this.finalizeWindow(window2);
+      }
+    this.live.delete(lectureId2);
+    await Promise.allSettled(
+      [...this.settling.values()].filter((entry) => entry.lectureId === lectureId2).map((entry) => entry.done)
+    );
+  }
+  /** Lectures in Trash or being permanently deleted get no new AI work (restoring resumes it). */
+  parked(lectureId2, trashed) {
+    if (!lectureId2) return false;
+    if (this.purging.has(lectureId2)) return true;
+    if (trashed) return trashed.has(lectureId2);
+    const row = this.store.db.prepare("SELECT deletedAt FROM lectures WHERE id=?").get(lectureId2);
+    return !row || row.deletedAt !== null;
   }
   retry(taskId) {
     const task = this.task(taskId);
     if (!task || !OWN_KINDS.has(task.kind)) throw new Error("Task not found.");
     if (task.status === "running" || task.status === "done") return task;
+    if ([...this.sessions].some((window2) => window2.taskId === taskId)) return task;
     const payload = { ...task.payload, livePending: false };
     this.store.taskUpdate(taskId, {
       status: "queued",
@@ -2156,14 +3114,30 @@ class AIService {
     task.payload = { ...task.payload, ...patch };
     this.store.taskUpdate(task.id, { payload: task.payload });
   }
+  /**
+   * A range task reads finalized audio from disk. While the lecture is still recording or awaiting
+   * recovery it may run only if every byte of its range is already in a finalized segment file.
+   */
+  rangeReady(task) {
+    if (!task.lectureId) return true;
+    const detail = this.store.lectureGet(task.lectureId);
+    if (detail.lecture.status === "ready") return true;
+    if (task.payload.endByte === null || task.payload.endByte === void 0) return false;
+    return Number(task.payload.endByte) <= audioEnd(detail.segments);
+  }
   async tick() {
     if (this.stopped || this.ticking) return;
     this.ticking = true;
     const generation = this.generation;
     try {
       const hasKey = Boolean(await this.getKey());
+      this.hasKey = hasKey;
       if (this.stopped || generation !== this.generation) return;
+      const trashed = new Set(
+        this.store.db.prepare("SELECT id FROM lectures WHERE deletedAt IS NOT NULL").all().map((row) => row.id)
+      );
       for (const lectureId2 of this.activeLectures) {
+        if (this.parked(lectureId2, trashed)) continue;
         try {
           this.scheduleIncremental(lectureId2);
           this.finalizeOriginal(lectureId2);
@@ -2177,12 +3151,14 @@ class AIService {
         if (!OWN_KINDS.has(task.kind) || task.status !== "queued" || task.nextRun > this.now() || this.running.has(task.id))
           continue;
         if (!hasKey && task.kind !== "finalize") continue;
-        if (task.kind === "finalize" || task.kind === "final-notes") {
-          if (task.lectureId) {
-            const detail = this.store.lectureGet(task.lectureId);
-            if (detail.lecture.status !== "ready" || detail.segments.some((s) => s.status !== "done"))
-              continue;
+        if (this.parked(task.lectureId, trashed)) continue;
+        try {
+          if ((task.kind === "finalize" || task.kind === "final-notes") && task.lectureId) {
+            if (this.transcriptionPending(task.lectureId)) continue;
           }
+          if (task.kind === "transcribe-range" && !this.rangeReady(task)) continue;
+        } catch {
+          continue;
         }
         const dependency = task.payload.previousTaskId ? tasks.find((t) => t.id === task.payload.previousTaskId) : void 0;
         if (dependency && (dependency.status === "queued" || dependency.status === "running")) continue;
@@ -2191,9 +3167,16 @@ class AIService {
         this.running.set(task.id, controller);
         this.store.taskUpdate(task.id, { status: "running", attempts: task.attempts + 1, error: null });
         task.attempts++;
-        void this.execute(task, controller.signal).then(() => {
-          if (generation === this.generation && this.task(task.id)?.status !== "cancelled")
+        const done = this.execute(task, controller.signal).then(() => {
+          if (generation === this.generation && this.task(task.id)?.status !== "cancelled") {
             this.store.taskUpdate(task.id, { status: "done", error: null });
+            if (task.lectureId && (task.kind === "transcribe" || task.kind === "transcribe-range"))
+              try {
+                this.scheduleIncremental(task.lectureId);
+                this.finalizeOriginal(task.lectureId);
+              } catch {
+              }
+          }
         }).catch((error) => {
           if (generation !== this.generation) return;
           if (this.task(task.id)?.status === "cancelled") return;
@@ -2221,11 +3204,14 @@ class AIService {
           if (state.status !== "queued")
             this.rejectWaiters(task.id, error instanceof Error ? error : new Error(state.error));
           this.emit({ type: "error", lectureId: task.lectureId ?? void 0, message: state.error });
+        }).catch(() => {
         }).finally(() => {
           this.running.delete(task.id);
+          this.settling.delete(task.id);
           this.changed(task.lectureId ?? void 0);
           if (!this.stopped) void this.tick();
         });
+        this.settling.set(task.id, { lectureId: task.lectureId, done });
       }
     } finally {
       this.ticking = false;
@@ -2263,7 +3249,9 @@ class AIService {
         originalText: void 0,
         text: void 0,
         segments: void 0,
-        results: void 0
+        results: void 0,
+        chunks: void 0,
+        gaps: void 0
       }
     });
   }
@@ -2272,6 +3260,8 @@ class AIService {
     switch (task.kind) {
       case "transcribe":
         return this.transcribe(task, signal);
+      case "transcribe-range":
+        return this.transcribeRange(task, signal);
       case "improve":
         return this.improveAudio(task, signal);
       case "translation":
@@ -2292,64 +3282,281 @@ class AIService {
         throw new Error("Unsupported AI task.");
     }
   }
+  /**
+   * One file transcription with language enforcement: a transcript outside the lecture language and
+   * English is retried once with a strict hint (no English allowance, no context); if it is still
+   * wrong it is returned as 'rejected' so the caller stores it hidden. Silence results store nothing.
+   */
+  async transcribeChecked(task, request, signal, operation, usageExtra = {}) {
+    const { voicedMs, ...base } = request;
+    let attempt = base;
+    for (; ; ) {
+      signal.throwIfAborted();
+      const result = await this.provider.transcribe(attempt, signal);
+      signal.throwIfAborted();
+      const check = checkTranscript(result.text, request.language, { detected: result.languages, voicedMs });
+      this.store.usageSave(task.lectureId, operation, request.model, {
+        ...result.usage,
+        ...usageExtra,
+        ...result.timestamps ? { timestampGranularity: "provider segment", timestamps: result.timestamps } : {},
+        ...result.languages ? { languages: result.languages } : {},
+        languageCheck: check.status === "ok" ? "ok" : `${check.status}:${check.reason}`,
+        strict: Boolean(attempt.strict)
+      });
+      if (check.status === "ok") return { status: "done", text: result.text, error: null };
+      if (check.status === "silent") return { status: "silent", text: "", error: null };
+      if (attempt.strict)
+        return {
+          status: "rejected",
+          text: result.text,
+          error: `Transcript was not in ${languageName(request.language)}/English (${check.reason}: ${check.detail}). Audio preserved.`
+        };
+      attempt = { ...attempt, strict: true, context: "" };
+    }
+  }
+  /** Speech in a WAV file, or null when the file cannot be analyzed (the provider then decides). */
+  async voicedMs(file) {
+    try {
+      const info = await wavDataOffset(file);
+      const pcm = (await promises.readFile(file)).subarray(info.offset, info.offset + info.bytes);
+      const levels = frameLevels(pcm);
+      return speechStats(levels, adaptiveThreshold(levels)).voicedMs;
+    } catch {
+      return null;
+    }
+  }
+  /** Legacy path: one saved segment (older recordings, imported audio) transcribed as a whole. */
   async transcribe(task, signal) {
     const detail = this.store.lectureGet(task.lectureId);
     const segment = detail.segments.find((s) => s.id === task.payload.segmentId);
     if (!segment) throw new APIError("Saved audio segment could not be found.", 404, "missing_audio");
     if (segment.status === "done") return;
-    this.forgetLive(task.id);
     this.store.segmentUpdate(segment.id, { status: "processing", error: null });
     const settings = this.store.settings(), model = String(task.payload.model ?? settings.fileModel);
     this.assertModel(model, "file");
-    const language2 = task.payload.language ?? settings.lectureLanguage, glossary = String(task.payload.glossary ?? this.glossary(task.lectureId));
+    const language2 = this.language(task.payload.language), glossary = String(task.payload.glossary ?? this.glossary(task.lectureId));
     this.checkpoint(task, { livePending: false, model, language: language2, glossary }, signal);
-    const previous = detail.segments.filter((s) => s.sequence < segment.sequence && s.status === "done").sort((a, b) => a.sequence - b.sequence).at(-1)?.text ?? "";
-    const result = await this.provider.transcribe(
-      { model, path: segment.path, language: language2, glossary, context: previous },
-      signal
-    );
+    const voicedMs = await this.voicedMs(segment.path);
     signal.throwIfAborted();
-    this.store.segmentUpdate(segment.id, { text: result.text, status: "done", error: null });
-    this.store.usageSave(task.lectureId, "transcribe", model, {
-      ...result.usage,
-      ...result.timestamps ? { timestampGranularity: "provider segment", timestamps: result.timestamps, segmentId: segment.id } : {},
-      ...result.languages ? { languages: result.languages } : {}
+    let result = { status: "silent", text: "", error: null };
+    if (voicedMs === null || voicedMs >= 400) {
+      const previous = detail.segments.filter((s) => s.sequence < segment.sequence && s.status === "done" && s.text).sort((a, b) => a.sequence - b.sequence).at(-1)?.text ?? "";
+      result = await this.transcribeChecked(
+        task,
+        {
+          model,
+          path: segment.path,
+          language: language2,
+          glossary,
+          context: previous,
+          ...voicedMs === null ? {} : { voicedMs }
+        },
+        signal,
+        "transcribe",
+        { segmentId: segment.id }
+      );
+    }
+    signal.throwIfAborted();
+    if (result.status === "rejected")
+      this.store.itemSave({
+        lectureId: segment.lectureId,
+        start: segment.start,
+        end: segment.end,
+        text: result.text,
+        status: "rejected",
+        source: "file",
+        model,
+        language: language2,
+        error: result.error,
+        sourceKey: `segment:${segment.id}`
+      });
+    this.store.segmentUpdate(segment.id, {
+      text: result.status === "done" ? result.text : "",
+      status: "done",
+      error: result.error
     });
     this.scheduleIncremental(task.lectureId);
     this.finalizeOriginal(task.lectureId);
     this.changed(task.lectureId);
   }
-  async improveAudio(task, signal) {
-    const detail = this.store.lectureGet(task.lectureId), settings = this.store.settings(), model = String(task.payload.model);
+  /** Splits disk audio into chunks at pauses (silent chunks are never sent). */
+  async planRange(segments, spans, signal) {
+    const chunks = [];
+    for (const span of spans) {
+      if (span.endByte <= span.startByte) continue;
+      const levels = await scanLevels(segments, span.startByte, span.endByte);
+      signal.throwIfAborted();
+      for (const chunk of planChunks(levels, span.startByte, { totalBytes: span.endByte - span.startByte }))
+        chunks.push(span.strict ? { ...chunk, strict: true } : chunk);
+    }
+    return chunks;
+  }
+  /**
+   * Transcribes a byte range of recorded audio from disk: the uncovered gaps of a closed realtime
+   * window, a crashed window, or audio no window saw (live transcription off). Each chunk result is a
+   * transcript item with a unique source key, so a resumed task never stores a chunk twice.
+   */
+  async transcribeRange(task, signal) {
+    const lectureId2 = task.lectureId;
+    let detail = this.store.lectureGet(lectureId2);
+    const settings = this.store.settings();
+    const segments = detail.segments.filter((s) => s.path);
+    const model = String(task.payload.model ?? settings.fileModel);
     this.assertModel(model, "file");
+    const language2 = this.language(task.payload.language), glossary = String(task.payload.glossary ?? this.glossary(lectureId2));
+    const startByte = Number(task.payload.startByte ?? 0);
+    const endByte = task.payload.endByte === null || task.payload.endByte === void 0 ? Math.max(startByte, audioEnd(segments)) : Number(task.payload.endByte);
+    let chunks = task.payload.chunks;
+    if (!Array.isArray(chunks)) {
+      let spans;
+      if (Array.isArray(task.payload.gaps)) spans = task.payload.gaps;
+      else {
+        const frontier = Math.max(startByte, Number(task.payload.frontierByte ?? startByte));
+        spans = subtractSpans(
+          [{ startByte: frontier, endByte }],
+          detail.items.filter((item) => item.status === "done").map((item) => ({ startByte: bytesAt(item.start), endByte: bytesAt(item.end) }))
+        );
+      }
+      spans = spans.map((span) => ({
+        ...span,
+        startByte: Math.max(startByte, Number(span.startByte)),
+        endByte: Math.min(endByte, Number(span.endByte))
+      })).filter((span) => span.endByte > span.startByte);
+      chunks = await this.planRange(segments, spans, signal);
+      this.checkpoint(task, { chunks, endByte, model, language: language2, glossary, livePending: false }, signal);
+    }
+    const cache = /* @__PURE__ */ new Map();
+    for (let index = 0; index < chunks.length; index++) {
+      const chunk = chunks[index], sourceKey = `range:${task.id}:${index}`;
+      if (!chunk.silent && !detail.items.some((item) => item.sourceKey === sourceKey)) {
+        const pcm = await readRange(segments, chunk.startByte, chunk.endByte, cache);
+        signal.throwIfAborted();
+        const context2 = transcriptUnits(detail.segments, detail.items).filter((unit) => unit.start < secondsAt(chunk.startByte)).at(-1)?.text ?? "";
+        const result = await this.transcribeChecked(
+          task,
+          {
+            model,
+            audio: pcmWav(pcm),
+            language: language2,
+            glossary,
+            context: context2,
+            strict: Boolean(chunk.strict),
+            voicedMs: chunk.voicedMs
+          },
+          signal,
+          "transcribe",
+          { range: [chunk.startByte, chunk.endByte] }
+        );
+        signal.throwIfAborted();
+        if (this.task(task.id)?.status === "cancelled") throw new Error("Task cancelled.");
+        if (result.status !== "silent")
+          this.store.itemSave({
+            lectureId: lectureId2,
+            start: secondsAt(chunk.startByte),
+            end: secondsAt(chunk.endByte),
+            text: result.text,
+            status: result.status === "done" ? "done" : "rejected",
+            source: "file",
+            model,
+            language: language2,
+            error: result.error,
+            sourceKey
+          });
+      }
+      this.checkpoint(task, { frontierByte: chunk.endByte }, signal);
+      detail = this.store.lectureGet(lectureId2);
+      this.scheduleIncremental(lectureId2);
+      this.changed(lectureId2);
+    }
+    this.checkpoint(task, { frontierByte: endByte }, signal);
+  }
+  async improveAudio(task, signal) {
+    if (task.payload.mode === "range") return this.improveRange(task, signal);
+    const detail = this.store.lectureGet(task.lectureId), model = String(task.payload.model);
+    this.assertModel(model, "file");
+    const language2 = this.language(task.payload.language);
     const segments = detail.segments.filter((s) => task.payload.segmentIds.includes(s.id)).sort((a, b) => a.sequence - b.sequence);
     const results = { ...task.payload.results ?? {} };
     for (const segment of segments)
       if (!(segment.id in results)) {
         const previous = results[segments[segments.indexOf(segment) - 1]?.id] ?? "";
-        const result = await this.provider.transcribe(
+        const voicedMs = await this.voicedMs(segment.path);
+        const result = voicedMs !== null && voicedMs < 400 ? { status: "silent", text: "" } : await this.transcribeChecked(
+          task,
           {
             model,
             path: segment.path,
-            language: task.payload.language ?? settings.lectureLanguage,
+            language: language2,
             glossary: String(task.payload.glossary ?? ""),
-            context: previous
+            context: previous,
+            ...voicedMs === null ? {} : { voicedMs }
           },
-          signal
+          signal,
+          "improve"
         );
         signal.throwIfAborted();
-        results[segment.id] = result.text;
+        results[segment.id] = result.status === "done" ? result.text : "";
         this.checkpoint(task, { results }, signal);
-        this.store.usageSave(task.lectureId, "improve", model, result.usage);
       }
     const content = orderedTranscript(segments.map((s) => ({ ...s, status: "done", text: results[s.id] })));
     this.saveResult(task, "improved", "Improved transcript · audio retranscription", content, model);
+  }
+  /** Retranscribes the whole saved audio timeline, split only at pauses, into a new version. */
+  async improveRange(task, signal) {
+    const lectureId2 = task.lectureId;
+    const detail = this.store.lectureGet(lectureId2), model = String(task.payload.model);
+    this.assertModel(model, "file");
+    const segments = detail.segments.filter((s) => s.path);
+    const language2 = this.language(task.payload.language), glossary = String(task.payload.glossary ?? "");
+    let chunks = task.payload.chunks;
+    if (!Array.isArray(chunks)) {
+      const startByte = Number(task.payload.startByte ?? 0), endByte = Number(task.payload.endByte ?? audioEnd(segments));
+      chunks = await this.planRange(segments, [{ startByte, endByte }], signal);
+      this.checkpoint(task, { chunks }, signal);
+    }
+    const results = { ...task.payload.results ?? {} };
+    const cache = /* @__PURE__ */ new Map();
+    for (let index = 0; index < chunks.length; index++) {
+      const chunk = chunks[index];
+      if (chunk.silent || String(index) in results) continue;
+      const pcm = await readRange(segments, chunk.startByte, chunk.endByte, cache);
+      const previous = Object.entries(results).filter(([key, value]) => Number(key) < index && value.status === "done").sort((a, b) => Number(a[0]) - Number(b[0])).at(-1)?.[1].text ?? "";
+      const result = await this.transcribeChecked(
+        task,
+        { model, audio: pcmWav(pcm), language: language2, glossary, context: previous, voicedMs: chunk.voicedMs },
+        signal,
+        "improve"
+      );
+      results[String(index)] = { text: result.text, status: result.status };
+      this.checkpoint(task, { results }, signal);
+    }
+    const units = chunks.flatMap((chunk, index) => {
+      const result = results[String(index)];
+      return result?.status === "done" && result.text ? [
+        {
+          id: String(index),
+          start: secondsAt(chunk.startByte),
+          end: secondsAt(chunk.endByte),
+          text: result.text,
+          kind: "item",
+          status: "done",
+          order: String(index).padStart(8, "0")
+        }
+      ] : [];
+    });
+    this.saveResult(
+      task,
+      "improved",
+      "Improved transcript · audio retranscription",
+      renderTranscript(units),
+      model
+    );
   }
   runAction(args) {
     const detail = this.store.lectureGet(args.lectureId), settings = this.store.settings();
     const source = args.versionId ? detail.versions.find((v) => v.id === args.versionId) : detail.versions.find((v) => v.id === detail.lecture.activeVersionId) ?? detail.versions.find((v) => v.kind === "original");
     if (args.versionId && !source) throw new Error("The selected version does not belong to this lecture.");
-    const text2 = args.text ?? source?.content ?? orderedTranscript(detail.segments);
+    const text2 = args.text ?? source?.content ?? orderedTranscript(detail.segments, detail.items);
     if (!text2.trim()) throw new Error("There is no finalized text to process yet.");
     let action = ACTION_ALIASES[args.action] ?? args.action, instruction = ACTIONS[action], model = action === "translate" ? settings.translationModel : settings.analysisModel, language2 = args.language ?? settings.outputLanguage, title = action, format = "markdown";
     if (args.customActionId) {
@@ -2390,7 +3597,8 @@ class AIService {
   }
   improve(lectureId2) {
     const detail = this.store.lectureGet(lectureId2);
-    if (!detail.segments.length) throw new Error("This lecture has no saved audio.");
+    const segments = detail.segments.filter((s) => s.path);
+    if (!segments.length) throw new Error("This lecture has no saved audio.");
     if (["recording", "paused"].includes(detail.lecture.status))
       throw new Error("Stop recording before retranscribing the saved audio.");
     const settings = this.store.settings();
@@ -2399,8 +3607,10 @@ class AIService {
       model: settings.fileModel,
       language: settings.lectureLanguage,
       glossary: this.glossary(lectureId2),
-      segmentIds: detail.segments.map((s) => s.id),
-      sourceVersionId: detail.versions.find((v) => v.kind === "original")?.id
+      startByte: 0,
+      endByte: audioEnd(segments),
+      sourceVersionId: detail.versions.find((v) => v.kind === "original")?.id,
+      mode: "range"
     };
     const task = this.store.taskAdd("improve", lectureId2, payload, `improve:${lectureId2}:${digest(payload)}`);
     this.changed(lectureId2);
@@ -2462,9 +3672,10 @@ Output language: ${LANGUAGE_NAMES[language2]}. Output format: ${task.payload.for
       this.checkpoint(
         task,
         {
-          text: source?.content ?? orderedTranscript(detail.segments),
+          text: source?.content ?? orderedTranscript(detail.segments, detail.items),
           sourceVersionId: source?.id,
-          coverageSegmentIds: detail.segments.map((s) => s.id)
+          coverageSegmentIds: detail.segments.map((s) => s.id),
+          coverageItemIds: detail.items.filter((item) => item.status === "done").map((item) => item.id)
         },
         signal
       );
@@ -2505,25 +3716,61 @@ Output language: ${LANGUAGE_NAMES[language2]}. Output format: ${task.payload.for
       model
     );
   }
+  /**
+   * Byte position before which a lecture's transcript can no longer change: the minimum over
+   * unfinished range tasks, live windows and legacy segments that are not yet transcribed.
+   */
+  frontier(lectureId2, detail, tasks) {
+    let frontier = Number.POSITIVE_INFINITY;
+    for (const task of tasks)
+      if (task.kind === "transcribe-range" && !["done", "cancelled"].includes(task.status))
+        frontier = Math.min(frontier, Number(task.payload.frontierByte ?? task.payload.startByte ?? 0));
+    for (const segment of detail.segments)
+      if (segment.status !== "done" && segment.status !== "audio")
+        frontier = Math.min(frontier, bytesAt(segment.start));
+    for (const window2 of this.sessions)
+      if (window2.lectureId === lectureId2 && !window2.finalized)
+        frontier = Math.min(frontier, window2.frontierByte);
+    return frontier;
+  }
   scheduleIncremental(lectureId2, force = false) {
-    const settings = this.store.settings(), detail = this.store.lectureGet(lectureId2), prefix = finalizedPrefix(detail.segments);
-    if (!prefix.length) return;
+    const settings = this.store.settings();
+    if (!settings.liveTranslation && !settings.liveAnalysis) return;
+    if (this.purging.has(lectureId2)) return;
+    const detail = this.store.lectureGet(lectureId2);
+    if (detail.lecture.deletedAt) return;
     const tasks = this.store.tasks().filter((t) => t.lectureId === lectureId2);
+    const frontier = this.frontier(lectureId2, detail, tasks);
+    const units = finalizedUnits(transcriptUnits(detail.segments, detail.items), secondsAt(frontier));
+    if (!units.length) return;
     for (const kind of ["translation", "analysis"]) {
       if (kind === "translation" ? !settings.liveTranslation : !settings.liveAnalysis) continue;
-      const prior = tasks.filter((t) => t.kind === kind && t.payload.stream === true).sort((a, b) => Number(a.payload.endSequence) - Number(b.payload.endSequence));
-      const last = prior.at(-1), cursor = Number(last?.payload.endSequence ?? -1);
-      const pending = prefix.filter((s) => s.sequence > cursor);
+      const prior = tasks.filter((t) => t.kind === kind && t.payload.stream === true);
+      const sent = new Set(
+        prior.flatMap((t) => [
+          ...t.payload.segmentIds ?? [],
+          ...t.payload.itemIds ?? []
+        ])
+      );
+      const last = prior.at(-1);
+      const pending = units.filter((unit) => !sent.has(unit.id));
       if (!pending.length) continue;
-      const text2 = orderedTranscript(pending);
-      const firstTask = tasks.find((t) => t.kind === "transcribe" && t.payload.segmentId === pending[0].id);
-      const pendingSince = firstTask ? Date.parse(firstTask.createdAt) : this.now();
-      const count = words(pending.map((s) => s.text).join(" "));
+      const text2 = renderTranscript(pending);
+      const itemTimes = detail.items.filter((item) => pending.some((unit) => unit.id === item.id)).map((item) => Date.parse(item.createdAt));
+      const firstTask = tasks.find(
+        (t) => t.kind === "transcribe" && pending.some((unit) => unit.id === t.payload.segmentId)
+      );
+      const pendingSince = Math.min(
+        ...itemTimes,
+        firstTask ? Date.parse(firstTask.createdAt) : Number.POSITIVE_INFINITY,
+        this.now()
+      );
+      const count = words(pending.map((unit) => unit.text).join(" "));
       if (!force && kind === "translation" && !(count >= settings.translationWords && sentenceComplete(text2) || this.now() - pendingSince >= settings.translationWaitSeconds * 1e3))
         continue;
       if (!force && kind === "analysis" && (count < settings.analysisWords || last && this.now() - Date.parse(last.createdAt) < settings.analysisIntervalSeconds * 1e3))
         continue;
-      const context2 = prefix.filter((s) => s.sequence <= cursor).slice(-3).map((s) => s.text).join("\n").slice(-2e3);
+      const context2 = units.filter((unit) => sent.has(unit.id)).slice(-3).map((unit) => unit.text).join("\n").slice(-2e3);
       const predecessor = kind === "translation" && last?.payload.language !== settings.outputLanguage ? prior.filter((t) => t.payload.language === settings.outputLanguage).at(-1) : last;
       const payload = {
         stream: true,
@@ -2531,9 +3778,10 @@ Output language: ${LANGUAGE_NAMES[language2]}. Output format: ${task.payload.for
         context: context2,
         language: settings.outputLanguage,
         model: kind === "translation" ? settings.translationModel : settings.analysisModel,
-        startSequence: pending[0].sequence,
-        endSequence: pending.at(-1).sequence,
-        segmentIds: pending.map((s) => s.id),
+        startByte: bytesAt(pending[0].start),
+        endByte: Math.max(...pending.map((unit) => bytesAt(unit.end))),
+        itemIds: pending.filter((unit) => unit.kind === "item").map((unit) => unit.id),
+        segmentIds: pending.filter((unit) => unit.kind === "segment").map((unit) => unit.id),
         previousTaskId: predecessor?.id
       };
       this.store.taskAdd(kind, lectureId2, payload, `${kind}:${lectureId2}:${digest(payload)}`);
@@ -2595,21 +3843,44 @@ ${task.payload.text}`
       model
     );
   }
+  /**
+   * True while any transcription of the lecture can still change: capture/recovery not finished,
+   * legacy segments untranscribed, transcription tasks outstanding (incl. failed ones awaiting a
+   * retry or cancel), or a realtime window still open or draining.
+   */
+  transcriptionPending(lectureId2, detail = this.store.lectureGet(lectureId2), tasks = this.store.tasks().filter((t) => t.lectureId === lectureId2)) {
+    if (detail.lecture.status !== "ready") return true;
+    if (detail.segments.some((s) => s.status !== "done" && s.status !== "audio")) return true;
+    if (tasks.some(
+      (t) => (t.kind === "transcribe" || t.kind === "transcribe-range") && ["queued", "running", "error", "quota"].includes(t.status)
+    ))
+      return true;
+    for (const window2 of this.sessions) if (window2.lectureId === lectureId2) return true;
+    return false;
+  }
   finalizeOriginal(lectureId2) {
+    if (this.purging.has(lectureId2)) return;
     const detail = this.store.lectureGet(lectureId2);
-    if (detail.lecture.status !== "ready" || !detail.segments.length || detail.segments.some((s) => s.status !== "done") || detail.versions.some((v) => v.kind === "original"))
+    if (detail.versions.some((v) => v.kind === "original")) return;
+    const tasks = this.store.tasks().filter((t) => t.lectureId === lectureId2);
+    if (this.transcriptionPending(lectureId2, detail, tasks)) return;
+    const units = transcriptUnits(detail.segments, detail.items);
+    const ranges = tasks.filter((t) => t.kind === "transcribe-range");
+    if (!units.length && !ranges.some((t) => t.status === "done") && !detail.segments.some((s) => s.status === "done"))
       return;
-    const sourceTasks = this.store.tasks().filter((t) => t.lectureId === lectureId2 && t.kind === "transcribe");
+    const settings = this.store.settings();
+    const sourceTasks = tasks.filter((t) => t.kind === "transcribe");
     const models = [
-      ...new Set(
-        sourceTasks.map(
+      .../* @__PURE__ */ new Set([
+        ...sourceTasks.map(
           (t) => String(
-            t.payload.livePending ? t.payload.liveModel ?? this.store.settings().liveModel : t.payload.model ?? this.store.settings().fileModel
+            t.payload.livePending ? t.payload.liveModel ?? settings.liveModel : t.payload.model ?? settings.fileModel
           )
-        )
-      )
+        ),
+        ...detail.items.filter((item) => item.status === "done").map((item) => item.model)
+      ])
     ];
-    const segmentModels = detail.segments.map((s) => {
+    const segmentModels = detail.segments.filter((s) => s.status === "done").map((s) => {
       const task = sourceTasks.find((t) => t.payload.segmentId === s.id);
       return {
         segmentId: s.id,
@@ -2620,12 +3891,14 @@ ${task.payload.text}`
       lectureId: lectureId2,
       kind: "original",
       title: "Original finalized transcript",
-      content: orderedTranscript(detail.segments),
+      content: orderedTranscript(detail.segments, detail.items),
       model: models.join(", "),
       parameters: {
         segmentIds: detail.segments.map((s) => s.id),
+        itemIds: units.filter((unit) => unit.kind === "item").map((unit) => unit.id),
         segmentModels,
-        timestampGranularity: "audio segment",
+        models,
+        timestampGranularity: detail.items.length ? "speech turn" : "audio segment",
         immutable: true
       }
     });
@@ -2633,6 +3906,15 @@ ${task.payload.text}`
   }
   flush(lectureId2) {
     this.activeLectures.add(lectureId2);
+    try {
+      if (ensureCoverage(this.store, lectureId2).length) void this.tick();
+    } catch (error) {
+      this.emit({
+        type: "error",
+        lectureId: lectureId2,
+        message: error instanceof Error ? error.message : "Could not schedule transcription."
+      });
+    }
     this.scheduleIncremental(lectureId2, true);
     this.finalizeOriginal(lectureId2);
     this.store.taskAdd("finalize", lectureId2, {}, `finalize:${lectureId2}`);
@@ -2795,367 +4077,564 @@ ${webSources.map((s) => `- [${s.title.replace(/[\[\]]/g, "")}](${s.url})`).join(
     this.checkpoint(task, { answerId: answer.id, passages: void 0 }, signal);
     this.resolveWaiters(task.id, answer);
   }
-  state(lectureId2) {
-    let state = this.live.get(lectureId2);
-    if (!state) {
-      state = {
-        connecting: false,
-        ready: false,
-        stopped: false,
-        born: 0,
-        retryAt: 0,
-        chunks: [],
-        buffered: 0,
-        segmentBytes: 0,
-        segmentComplete: true,
-        sent: [],
-        items: /* @__PURE__ */ new Map(),
-        early: /* @__PURE__ */ new Map(),
-        partial: /* @__PURE__ */ new Map()
-      };
-      this.live.set(lectureId2, state);
-      this.sessions.add(state);
+  // ───────────────────────── Realtime transcription (continuous stream) ─────────────────────────
+  /**
+   * Durable audio slice from the recorder at lecture byte `offset`. Audio streams continuously to
+   * the current window's realtime session; phrase boundaries come from server turn detection or, for
+   * models without it, from local pause detection. A discontinuity (pause/resume, missed slices)
+   * closes the window and opens a new one at the new offset.
+   */
+  liveAppend(lectureId2, pcm, offset) {
+    if (this.stopped || !pcm.length) return;
+    try {
+      if (!this.store.settings().liveTranscription) return;
+      this.appendLive(lectureId2, pcm, offset);
+    } catch (error) {
+      const last = this.liveErrors.get(lectureId2) ?? 0;
+      if (this.now() - last > 3e4) {
+        this.liveErrors.set(lectureId2, this.now());
+        this.emit({
+          type: "error",
+          lectureId: lectureId2,
+          message: `Live transcription paused: ${error instanceof Error ? error.message : "unknown error"}. The audio is saved and will be transcribed from disk.`
+        });
+      }
     }
-    return state;
   }
-  liveAppend(lectureId2, pcm) {
-    if (!this.store.settings().liveTranscription) return;
+  appendLive(lectureId2, pcm, offset) {
     this.activeLectures.add(lectureId2);
-    let state = this.state(lectureId2);
-    if (state.stopped) return;
-    if (state.ready && state.segmentBytes === 0 && this.now() - state.born >= 55 * 60 * 1e3) {
-      this.renewLive(lectureId2, state);
-      state = this.state(lectureId2);
+    let window2 = this.live.get(lectureId2);
+    if (window2 && offset !== window2.startByte + window2.bytes) {
+      this.closeWindow(window2, "stop");
+      window2 = void 0;
     }
-    state.segmentBytes += pcm.length;
-    if (state.ready && state.socket?.readyState === WebSocket.OPEN) {
-      if (state.socket.bufferedAmount > 1024 * 1024) {
-        this.failLive(
-          lectureId2,
-          state,
-          "Realtime connection could not keep up. Saved segments will be transcribed from disk."
+    window2 ??= this.openWindow(lectureId2, offset);
+    if (!window2) return;
+    window2.silence.push(pcm, offset);
+    window2.bytes += pcm.length;
+    if (window2.detached) {
+      if (this.now() >= window2.retryAt && this.hasKey !== false && cutAllowed(this.now() - window2.detachedAt, window2.silence.trailingSilentMs))
+        this.closeWindow(window2, "cut");
+      return;
+    }
+    if (window2.ready && window2.socket?.readyState === WebSocket.OPEN) {
+      if (window2.socket.bufferedAmount > 1024 * 1024) {
+        this.failWindow(
+          window2,
+          "Realtime connection could not keep up. The recorded audio will be transcribed from disk."
         );
-        state.segmentComplete = false;
         return;
       }
-      state.socket.send(JSON.stringify({ type: "input_audio_buffer.append", audio: pcm.toString("base64") }));
-    } else if (state.segmentComplete && state.buffered + pcm.length <= 6e5) {
-      state.chunks.push(Buffer.from(pcm));
-      state.buffered += pcm.length;
+      this.sendAudio(window2, pcm);
+    } else if (window2.preReadyBytes + pcm.length <= PRE_READY_LIMIT) {
+      window2.preReady.push(Buffer.from(pcm));
+      window2.preReadyBytes += pcm.length;
+      return;
     } else {
-      state.chunks = [];
-      state.buffered = 0;
-      state.segmentComplete = false;
+      this.failWindow(window2, "Realtime connection is slow. The recorded audio will be transcribed from disk.");
+      return;
     }
-    if (!state.ready && !state.connecting && this.now() >= state.retryAt && state.segmentComplete)
-      void this.connectLive(lectureId2, state);
+    this.afterSend(window2);
   }
-  liveCommit(lectureId2, segment) {
-    if (!this.store.settings().liveTranscription) return;
-    const state = this.state(lectureId2), settings = this.store.settings();
-    if (state.sent.length + state.items.size >= 12)
-      this.failLive(
-        lectureId2,
-        state,
-        "Realtime finalization is delayed. Saved segments remain in the file processing queue."
-      );
+  /** Recording paused: close the window so resumed audio starts a fresh session. */
+  livePause(lectureId2) {
+    const window2 = this.live.get(lectureId2);
+    if (window2) this.closeWindow(window2, "pause");
+  }
+  liveStop(lectureId2) {
+    const window2 = this.live.get(lectureId2);
+    if (window2) this.closeWindow(window2, "stop");
+  }
+  openWindow(lectureId2, offset) {
+    const settings = this.store.settings();
+    const id2 = node_crypto.randomUUID(), model = settings.liveModel, language2 = settings.lectureLanguage, glossary = this.glossary(lectureId2);
     const task = this.store.taskAdd(
-      "transcribe",
+      "transcribe-range",
       lectureId2,
       {
-        segmentId: segment.id,
+        windowId: id2,
+        startByte: offset,
+        endByte: null,
+        frontierByte: offset,
+        livePending: true,
+        origin: "live",
         model: settings.fileModel,
-        liveModel: state.model ?? settings.liveModel,
-        language: settings.lectureLanguage,
-        glossary: this.glossary(lectureId2),
-        livePending: true
+        liveModel: model,
+        language: language2,
+        glossary
       },
-      `transcribe:${segment.id}`
+      `range:${id2}`
     );
-    const expected = Math.round((segment.end - segment.start) * 24e3) * 2;
-    const complete = state.segmentComplete && Math.abs(state.segmentBytes - expected) <= 4;
-    const canCommit = complete && state.ready && state.socket?.readyState === WebSocket.OPEN && state.segmentBytes >= 4800;
-    this.store.taskUpdate(task.id, {
-      nextRun: this.now() + (canCommit ? 45e3 : 0),
-      payload: { ...task.payload, livePending: Boolean(canCommit) }
-    });
-    if (canCommit) {
-      state.sent.push({ segmentId: segment.id, taskId: task.id, sequence: segment.sequence });
-      this.store.segmentUpdate(segment.id, { status: "processing", error: null });
-      state.socket.send(
-        JSON.stringify({ type: "input_audio_buffer.commit", event_id: `commit_${segment.id}` })
-      );
-    } else if (state.ready) state.socket?.send(JSON.stringify({ type: "input_audio_buffer.clear" }));
-    state.chunks = [];
-    state.buffered = 0;
-    state.segmentBytes = 0;
-    state.segmentComplete = true;
-    if (state.ready && this.now() - state.born >= 55 * 60 * 1e3) {
-      this.renewLive(lectureId2, state);
-    }
-    this.changed(lectureId2);
-    void this.tick();
-  }
-  stateFresh() {
-    return {
+    this.store.taskUpdate(task.id, { nextRun: Number.MAX_SAFE_INTEGER });
+    const window2 = {
+      id: id2,
+      lectureId: lectureId2,
+      taskId: task.id,
+      policy: turnPolicy(model),
+      vad: turnPolicy(model) === "server" ? "semantic" : "none",
+      model,
+      language: language2,
+      glossary,
+      startByte: offset,
+      bytes: 0,
+      sentBytes: 0,
+      detached: false,
+      detachedAt: 0,
+      retryAt: 0,
+      finalized: false,
       connecting: false,
       ready: false,
-      stopped: false,
-      born: 0,
-      retryAt: 0,
-      chunks: [],
-      buffered: 0,
-      segmentBytes: 0,
-      segmentComplete: true,
-      sent: [],
-      items: /* @__PURE__ */ new Map(),
-      early: /* @__PURE__ */ new Map(),
-      partial: /* @__PURE__ */ new Map()
+      openedAt: 0,
+      preReady: [],
+      preReadyBytes: 0,
+      turns: [],
+      byItem: /* @__PURE__ */ new Map(),
+      localFifo: [],
+      localCount: 0,
+      turnStartByte: offset,
+      frontierByte: offset,
+      silence: new SilenceTracker(),
+      partial: /* @__PURE__ */ new Map(),
+      early: /* @__PURE__ */ new Map()
     };
+    this.live.set(lectureId2, window2);
+    this.sessions.add(window2);
+    if (this.hasKey === false) this.detach(window2, 3e4);
+    else void this.connect(window2);
+    return window2;
   }
-  renewLive(lectureId2, old) {
-    const fresh = this.stateFresh();
-    this.live.set(lectureId2, fresh);
-    this.sessions.add(fresh);
-    old.stopped = true;
-    if (!old.items.size && !old.sent.length) this.closeLive(old);
-    else {
-      old.drainTimer = setTimeout(() => this.failLive(lectureId2, old), 45e3);
-      old.drainTimer.unref();
-    }
-    void this.connectLive(lectureId2, fresh);
+  detach(window2, retryMs) {
+    const failures = (this.liveFailures.get(window2.lectureId) ?? 0) + 1;
+    this.liveFailures.set(window2.lectureId, failures);
+    window2.detached = true;
+    window2.ready = false;
+    window2.connecting = false;
+    window2.detachedAt = this.now();
+    window2.retryAt = this.now() + (retryMs ?? Math.min(5 * MINUTE, 15e3 * 2 ** Math.min(5, failures - 1)));
+    window2.preReady = [];
+    window2.preReadyBytes = 0;
   }
-  async connectLive(lectureId2, state) {
-    state.connecting = true;
-    this.sessions.add(state);
+  async connect(window2) {
+    window2.connecting = true;
     try {
       const key = await this.getKey();
+      if (window2.finalized || window2.closing || this.stopped) {
+        window2.connecting = false;
+        if (window2.closing) this.finalizeWindow(window2);
+        return;
+      }
       if (!key) {
-        state.retryAt = this.now() + 3e4;
-        state.connecting = false;
+        this.hasKey = false;
+        this.detach(window2, 3e4);
         return;
       }
-      const settings = this.store.settings();
-      this.assertModel(settings.liveModel, "live");
-      state.model = settings.liveModel;
-      if (state.stopped || this.stopped) {
-        state.connecting = false;
-        return;
-      }
+      this.assertModel(window2.model, "live");
       const socket = this.socketFactory(key);
-      state.socket = socket;
-      state.connectionTimer = setTimeout(
-        () => this.failLive(lectureId2, state, "Realtime connection timed out. Audio remains saved locally."),
+      window2.socket = socket;
+      window2.openedAt = this.now();
+      window2.connectionTimer = setTimeout(
+        () => this.failWindow(window2, "Realtime connection timed out. Audio remains saved locally."),
         15e3
       );
-      state.connectionTimer.unref();
-      socket.on(
-        "open",
-        () => socket.send(
-          JSON.stringify({
-            type: "session.update",
-            session: {
-              type: "transcription",
-              audio: {
-                input: {
-                  format: { type: "audio/pcm", rate: 24e3 },
-                  transcription: transcriptionSettings(
-                    settings.liveModel,
-                    settings.lectureLanguage,
-                    this.glossary(lectureId2),
-                    true
-                  ),
-                  turn_detection: null
-                }
-              }
-            }
-          })
-        )
-      );
+      window2.connectionTimer.unref?.();
+      socket.on("open", () => this.sendSession(window2));
       socket.on("message", (data) => {
+        let event;
         try {
-          this.realtimeEvent(lectureId2, state, JSON.parse(data.toString()));
+          event = JSON.parse(data.toString());
         } catch {
-          this.failLive(
-            lectureId2,
-            state,
-            "Realtime returned an invalid event. Saved audio will be processed from disk."
+          this.failWindow(window2, "Realtime returned an invalid event. Saved audio will be processed from disk.");
+          return;
+        }
+        try {
+          this.realtimeEvent(window2, event);
+        } catch (error) {
+          this.failWindow(
+            window2,
+            error instanceof Error ? error.message : "Realtime event could not be processed."
           );
         }
       });
       socket.on(
         "error",
-        () => this.failLive(
-          lectureId2,
-          state,
-          "Realtime connection failed. Saved audio will be processed from disk."
-        )
+        () => this.failWindow(window2, "Realtime connection failed. Saved audio will be processed from disk.")
       );
-      socket.on("close", () => this.failLive(lectureId2, state));
+      socket.on("close", () => this.failWindow(window2));
     } catch (error) {
-      this.failLive(
-        lectureId2,
-        state,
-        error instanceof Error ? error.message : "Unable to connect realtime transcription."
-      );
+      this.failWindow(window2, error instanceof Error ? error.message : "Unable to connect realtime transcription.");
     }
   }
-  realtimeEvent(lectureId2, state, event) {
-    if (event.type === "session.updated" || event.type === "transcription_session.updated") {
-      if (state.connectionTimer) clearTimeout(state.connectionTimer);
-      state.connectionTimer = void 0;
-      state.ready = true;
-      state.connecting = false;
-      state.born = this.now();
-      if (state.segmentComplete)
-        for (const chunk of state.chunks)
-          state.socket?.send(
-            JSON.stringify({ type: "input_audio_buffer.append", audio: chunk.toString("base64") })
-          );
-      state.chunks = [];
-      state.buffered = 0;
-      return;
-    }
-    if (event.type === "input_audio_buffer.committed") {
-      const commit2 = state.sent.shift();
-      if (!commit2) return;
-      state.items.set(String(event.item_id), commit2);
-      for (const early of state.early.get(String(event.item_id)) ?? [])
-        this.realtimeEvent(lectureId2, state, early);
-      state.early.delete(String(event.item_id));
-      return;
-    }
-    if (event.type === "error") {
-      this.failLive(
-        lectureId2,
-        state,
-        `Realtime transcription failed: ${String(event.error?.code ?? "provider error")}. Saved segments remain queued.`
+  sendSession(window2) {
+    window2.socket?.send(
+      JSON.stringify(
+        realtimeSession(
+          window2.model,
+          window2.language,
+          window2.glossary,
+          window2.policy,
+          window2.vad === "server" ? "server" : "semantic",
+          `session_${window2.id}`
+        )
+      )
+    );
+  }
+  sendAudio(window2, pcm) {
+    window2.socket.send(JSON.stringify({ type: "input_audio_buffer.append", audio: pcm.toString("base64") }));
+    window2.sentBytes += pcm.length;
+  }
+  /** Commit/renewal decisions after audio reached the session. */
+  afterSend(window2) {
+    if (window2.finalized || window2.detached || !window2.ready) return;
+    if (window2.turns.filter((t) => t.status === "pending" || t.status === "speaking").length > 12) {
+      this.failWindow(
+        window2,
+        "Realtime finalization is delayed. The recorded audio will be transcribed from disk."
       );
       return;
     }
-    if (!event.item_id || !event.type.startsWith("conversation.item.input_audio_transcription.")) return;
-    const id2 = String(event.item_id), commit = state.items.get(id2);
-    if (!commit) {
-      if (state.sent.length || state.segmentBytes > 0 && !state.stopped) {
-        if (event.type.endsWith(".delta") && state.partial.size < 12) {
-          const text2 = `${state.partial.get(id2) ?? ""}${String(event.delta ?? "")}`.slice(-24e3);
-          state.partial.set(id2, text2);
-          this.emit({ type: "partial", lectureId: lectureId2, text: text2 });
-        } else if (state.early.size < 12)
-          state.early.set(id2, [...state.early.get(id2) ?? [], event].slice(-20));
-      }
+    if (window2.policy === "local") {
+      const turnMs = (window2.startByte + window2.sentBytes - window2.turnStartByte) / BYTES_PER_MS;
+      if (shouldCommit(turnMs, window2.silence.trailingSilentMs)) this.commitLocal(window2);
+      else if (this.now() - window2.openedAt >= 59.5 * MINUTE) this.renew(window2);
       return;
     }
-    if (event.type.endsWith(".delta")) {
-      const text2 = `${state.partial.get(id2) ?? ""}${String(event.delta ?? "")}`.slice(-24e3);
-      state.partial.set(id2, text2);
-      this.emit({ type: "partial", lectureId: lectureId2, segmentId: commit.segmentId, text: text2 });
-      return;
-    }
-    if (event.type.endsWith(".completed")) {
-      const task = this.task(commit.taskId), segment = this.store.lectureGet(lectureId2).segments.find((s) => s.id === commit.segmentId);
-      if (task?.status === "queued" && segment && segment.status !== "done") {
-        this.store.segmentUpdate(commit.segmentId, {
-          text: String(event.transcript ?? ""),
-          status: "done",
-          error: null
-        });
-        this.store.taskUpdate(commit.taskId, { status: "done", error: null });
-        if (event.usage)
-          this.store.usageSave(
-            lectureId2,
-            "live-transcribe",
-            state.model ?? this.store.settings().liveModel,
-            event.usage
-          );
-        this.scheduleIncremental(lectureId2);
-        this.finalizeOriginal(lectureId2);
-        this.changed(lectureId2);
-      }
-      state.items.delete(id2);
-      state.partial.delete(id2);
-      const pending = [...state.partial.values()].at(-1) ?? "";
-      this.emit({ type: "partial", lectureId: lectureId2, text: pending });
-      if (state.stopped && !state.items.size && !state.sent.length) {
-        this.closeLive(state);
-        if (this.live.get(lectureId2) === state) this.live.delete(lectureId2);
-      }
-    } else if (event.type.endsWith(".failed")) {
-      const task = this.task(commit.taskId);
-      if (task?.status === "queued")
-        this.store.taskUpdate(task.id, {
-          nextRun: this.now(),
-          payload: { ...task.payload, livePending: false },
-          error: "Realtime turn failed; saved file fallback queued."
-        });
-      state.items.delete(id2);
-      state.partial.delete(id2);
-      void this.tick();
-    }
+    const age = this.now() - window2.openedAt;
+    if (age < 55 * MINUTE) return;
+    const speaking = window2.turns.some((t) => t.status === "speaking"), trailing = window2.silence.trailingSilentMs;
+    if (!speaking && trailing >= 300 || age >= 58 * MINUTE && trailing >= 100 || age >= 59.5 * MINUTE)
+      this.renew(window2);
   }
-  forgetLive(taskId) {
-    for (const state of this.live.values()) {
-      for (const [id2, commit] of state.items)
-        if (commit.taskId === taskId) {
-          state.items.delete(id2);
-          state.partial.delete(id2);
+  /**
+   * Local policy: close the open turn at the current position. Turns without speech are cleared on
+   * the server (silence is never committed); a voiced turn is committed and awaits its transcript.
+   */
+  commitLocal(window2) {
+    const end = window2.startByte + window2.sentBytes;
+    if (end <= window2.turnStartByte) return;
+    const key = `local:${window2.localCount++}`;
+    if (window2.silence.turnVoicedMs < 300 || window2.silence.firstVoicedByte === null) {
+      window2.socket?.send(JSON.stringify({ type: "input_audio_buffer.clear" }));
+      window2.turns.push({ key, startByte: window2.turnStartByte, endByte: end, status: "silent" });
+      window2.partial.clear();
+      this.emit({ type: "partial", lectureId: window2.lectureId, text: "" });
+    } else {
+      window2.socket?.send(
+        JSON.stringify({ type: "input_audio_buffer.commit", event_id: `commit_${window2.id}_${key.slice(6)}` })
+      );
+      const turn = {
+        key,
+        startByte: window2.turnStartByte,
+        endByte: end,
+        itemStart: Math.max(window2.turnStartByte, window2.silence.firstVoicedByte - 200 * BYTES_PER_MS),
+        itemEnd: Math.min(end, (window2.silence.lastVoicedByte ?? end) + 200 * BYTES_PER_MS),
+        voicedMs: window2.silence.turnVoicedMs,
+        status: "pending"
+      };
+      window2.turns.push(turn);
+      window2.localFifo.push(turn);
+    }
+    window2.silence.resetTurn();
+    window2.turnStartByte = end;
+    this.updateFrontier(window2);
+    if (!window2.closing && this.now() - window2.openedAt >= 55 * MINUTE) this.renew(window2);
+  }
+  /** Session renewal before the 60-minute limit, at a turn boundary; audio continues seamlessly. */
+  renew(window2) {
+    if (window2.closing || window2.finalized) return;
+    const next = window2.startByte + window2.bytes;
+    this.closeWindow(window2, "renew");
+    this.openWindow(window2.lectureId, next);
+  }
+  clampByte(window2, byte) {
+    return Math.min(window2.startByte + window2.sentBytes, Math.max(window2.startByte, byte));
+  }
+  realtimeEvent(window2, event) {
+    if (window2.finalized) return;
+    const type = String(event?.type ?? "");
+    if (type === "session.updated" || type === "transcription_session.updated") {
+      if (window2.ready) return;
+      if (window2.connectionTimer) clearTimeout(window2.connectionTimer);
+      window2.connectionTimer = void 0;
+      window2.ready = true;
+      window2.connecting = false;
+      this.liveFailures.delete(window2.lectureId);
+      const queued = window2.preReady;
+      window2.preReady = [];
+      window2.preReadyBytes = 0;
+      for (const chunk of queued) this.sendAudio(window2, chunk);
+      if (window2.closing) this.closeTurns(window2);
+      else this.afterSend(window2);
+      this.maybeFinalize(window2);
+      return;
+    }
+    if (type === "error") {
+      const error = event.error ?? {};
+      const code = String(error.code ?? "");
+      if (code === "input_audio_buffer_commit_empty") {
+        const turn2 = window2.localFifo.shift();
+        if (turn2) {
+          turn2.status = "silent";
+          this.updateFrontier(window2);
+          this.maybeFinalize(window2);
         }
+        return;
+      }
+      const about = `${error.event_id ?? ""} ${error.param ?? ""} ${error.message ?? ""}`;
+      if (!window2.ready && /session|turn_detection|vad/i.test(about) && window2.policy === "server") {
+        if (window2.vad === "semantic") window2.vad = "server";
+        else {
+          window2.policy = "local";
+          window2.vad = "none";
+        }
+        this.sendSession(window2);
+        return;
+      }
+      this.failWindow(
+        window2,
+        `Realtime transcription failed: ${code || "provider error"}. The recorded audio will be transcribed from disk.`
+      );
+      return;
+    }
+    if (type === "input_audio_buffer.speech_started" && event.item_id) {
+      const id22 = String(event.item_id);
+      const startByte = this.clampByte(window2, window2.startByte + ms2b(event.audio_start_ms ?? 0));
+      const turn2 = window2.byItem.get(id22) ?? { key: id22, startByte, endByte: null, status: "speaking" };
+      turn2.startByte = startByte;
+      turn2.itemId = id22;
+      if (!window2.byItem.has(id22)) {
+        window2.byItem.set(id22, turn2);
+        window2.turns.push(turn2);
+      }
+      this.updateFrontier(window2);
+      return;
+    }
+    if (type === "input_audio_buffer.speech_stopped" && event.item_id) {
+      const id22 = String(event.item_id);
+      let turn2 = window2.byItem.get(id22);
+      const endByte = this.clampByte(window2, window2.startByte + ms2b(event.audio_end_ms ?? 0));
+      if (!turn2) {
+        turn2 = { key: id22, startByte: this.lastTurnEnd(window2), endByte, status: "pending", itemId: id22 };
+        window2.byItem.set(id22, turn2);
+        window2.turns.push(turn2);
+      }
+      turn2.endByte = Math.max(turn2.startByte, endByte);
+      if (turn2.status === "speaking") turn2.status = "pending";
+      this.updateFrontier(window2);
+      return;
+    }
+    if (type === "input_audio_buffer.committed" && event.item_id) {
+      const id22 = String(event.item_id);
+      if (window2.policy === "local") {
+        const turn2 = window2.localFifo.shift();
+        if (!turn2) return;
+        turn2.itemId = id22;
+        window2.byItem.set(id22, turn2);
+      } else {
+        let turn2 = window2.byItem.get(id22);
+        const end = window2.startByte + window2.sentBytes;
+        if (!turn2) {
+          turn2 = { key: id22, startByte: this.lastTurnEnd(window2), endByte: end, status: "pending", itemId: id22 };
+          window2.byItem.set(id22, turn2);
+          window2.turns.push(turn2);
+        } else if (turn2.status === "speaking") {
+          turn2.endByte = end;
+          turn2.status = "pending";
+        }
+      }
+      for (const early of window2.early.get(id22) ?? []) this.realtimeEvent(window2, early);
+      window2.early.delete(id22);
+      this.updateFrontier(window2);
+      return;
+    }
+    if (!event.item_id || !type.startsWith("conversation.item.input_audio_transcription.")) return;
+    const id2 = String(event.item_id);
+    const turn = window2.byItem.get(id2);
+    if (type.endsWith(".delta")) {
+      if (!turn && window2.partial.size >= 12) return;
+      const text2 = `${window2.partial.get(id2) ?? ""}${String(event.delta ?? "")}`.slice(-24e3);
+      window2.partial.set(id2, text2);
+      const start = turn?.itemStart ?? turn?.startByte ?? window2.localFifo[0]?.startByte ?? window2.turnStartByte;
+      this.emit({ type: "partial", lectureId: window2.lectureId, text: text2, start: secondsAt(start) });
+      return;
+    }
+    if (!turn) {
+      if (window2.early.size < 12) window2.early.set(id2, [...window2.early.get(id2) ?? [], event].slice(-20));
+      return;
+    }
+    if (type.endsWith(".completed")) this.completeTurn(window2, turn, id2, event);
+    else if (type.endsWith(".failed")) {
+      if (turn.status === "pending" || turn.status === "speaking") turn.status = "failed";
+      window2.partial.delete(id2);
+      this.updateFrontier(window2);
+      this.maybeFinalize(window2);
     }
   }
-  closeLive(state) {
-    if (state.connectionTimer) clearTimeout(state.connectionTimer);
-    if (state.drainTimer) clearTimeout(state.drainTimer);
-    state.connectionTimer = void 0;
-    state.drainTimer = void 0;
-    state.ready = false;
-    state.connecting = false;
-    state.chunks = [];
-    state.buffered = 0;
-    const socket = state.socket;
-    state.socket = void 0;
+  lastTurnEnd(window2) {
+    return Math.max(window2.startByte, ...window2.turns.map((t) => t.endByte ?? t.startByte));
+  }
+  completeTurn(window2, turn, id2, event) {
+    window2.partial.delete(id2);
+    const task = this.task(window2.taskId);
+    if (!task || task.status !== "queued" || !task.payload.livePending) return;
+    if (turn.status === "done" || turn.status === "silent") return;
+    const windowEnd = window2.startByte + window2.bytes;
+    const endByte = Math.min(windowEnd, turn.endByte ?? window2.startByte + window2.sentBytes);
+    turn.endByte = Math.max(turn.startByte, endByte);
+    const text2 = String(event.transcript ?? "");
+    const voicedMs = turn.voicedMs ?? (turn.endByte - turn.startByte) / BYTES_PER_MS;
+    const check = checkTranscript(text2, window2.language, { detected: event.languages, voicedMs });
+    if (check.status === "ok") {
+      const start = Math.max(window2.startByte, turn.itemStart ?? turn.startByte), end = Math.min(turn.endByte, turn.itemEnd ?? turn.endByte);
+      this.store.itemSave({
+        lectureId: window2.lectureId,
+        start: secondsAt(start),
+        end: secondsAt(Math.max(start, end)),
+        text: text2,
+        status: "done",
+        source: "live",
+        model: window2.model,
+        language: window2.language,
+        error: null,
+        sourceKey: `live:${window2.id}:${id2}`
+      });
+      turn.status = "done";
+    } else if (check.status === "silent") turn.status = "silent";
+    else {
+      turn.status = "failed";
+      turn.strict = true;
+    }
+    if (event.usage || check.status !== "ok")
+      this.store.usageSave(window2.lectureId, "live-transcribe", window2.model, {
+        ...event.usage ?? {},
+        ...event.languages ? { languages: event.languages } : {},
+        languageCheck: check.status === "ok" ? "ok" : `${check.status}:${check.reason}`
+      });
+    const pending = [...window2.partial.entries()].at(-1);
+    this.emit({ type: "partial", lectureId: window2.lectureId, text: pending?.[1] ?? "" });
+    this.updateFrontier(window2);
+    this.scheduleIncremental(window2.lectureId);
+    this.finalizeOriginal(window2.lectureId);
+    this.changed(window2.lectureId);
+    this.maybeFinalize(window2);
+  }
+  updateFrontier(window2) {
+    const frontier = turnFrontier(window2.turns, window2.startByte);
+    if (frontier === window2.frontierByte) return;
+    window2.frontierByte = frontier;
+    const task = this.task(window2.taskId);
+    if (task && task.status === "queued" && task.payload.livePending)
+      this.store.taskUpdate(task.id, { payload: { ...task.payload, frontierByte: frontier } });
+  }
+  /** Commits or clears the open turn when a window closes, so its tail is not left unaccounted. */
+  closeTurns(window2) {
+    if (!window2.ready || !window2.socket || window2.socket.readyState !== WebSocket.OPEN) return;
+    if (window2.policy === "local") this.commitLocal(window2);
+    else if (window2.turns.some((t) => t.status === "speaking"))
+      window2.socket.send(JSON.stringify({ type: "input_audio_buffer.commit", event_id: `commit_${window2.id}_close` }));
+  }
+  /**
+   * Stops sending audio to the window. Its end is persisted at once (the task keeps livePending so
+   * late results are still accepted); it is finalized when outstanding turns finish or after 45 s.
+   */
+  closeWindow(window2, reason) {
+    if (window2.closing || window2.finalized) return;
+    window2.closing = reason;
+    if (this.live.get(window2.lectureId) === window2) this.live.delete(window2.lectureId);
+    const task = this.task(window2.taskId);
+    if (task && task.status === "queued" && task.payload.livePending)
+      this.store.taskUpdate(task.id, {
+        payload: { ...task.payload, endByte: window2.startByte + window2.bytes }
+      });
+    if (window2.detached || !window2.ready) {
+      this.finalizeWindow(window2);
+      return;
+    }
+    this.closeTurns(window2);
+    if (!this.maybeFinalize(window2)) {
+      window2.drainTimer = setTimeout(() => this.finalizeWindow(window2), DRAIN_MS);
+      window2.drainTimer.unref?.();
+    }
+  }
+  maybeFinalize(window2) {
+    if (!window2.closing || window2.finalized) return window2.finalized;
+    if (window2.turns.some((t) => t.status === "pending" || t.status === "speaking")) return false;
+    this.finalizeWindow(window2);
+    return true;
+  }
+  closeSocket(window2) {
+    if (window2.connectionTimer) clearTimeout(window2.connectionTimer);
+    window2.connectionTimer = void 0;
+    window2.ready = false;
+    window2.connecting = false;
+    const socket = window2.socket;
+    window2.socket = void 0;
     if (socket) {
       socket.removeAllListeners();
       socket.on("error", () => {
       });
       if (socket.readyState !== WebSocket.CLOSED) socket.terminate();
     }
-    this.sessions.delete(state);
   }
-  failLive(lectureId2, state, message) {
-    const hadConnection = Boolean(state.socket) || state.connecting || state.ready;
-    this.closeLive(state);
-    state.retryAt = this.now() + 15e3;
-    state.segmentComplete = false;
-    for (const commit of [...state.sent, ...state.items.values()]) {
-      const task = this.task(commit.taskId);
-      if (task?.status === "queued")
-        this.store.taskUpdate(task.id, {
-          nextRun: this.now(),
-          payload: { ...task.payload, livePending: false }
-        });
-    }
-    state.sent = [];
-    state.items.clear();
-    state.early.clear();
-    state.partial.clear();
-    this.emit({ type: "partial", lectureId: lectureId2, text: "" });
-    if (message && hadConnection) this.emit({ type: "error", lectureId: lectureId2, message });
+  /**
+   * Connection lost or unusable: outstanding turns become disk work, the window keeps accounting
+   * for recorded audio (detached) and is cut at the next pause so a new connection can be tried.
+   */
+  failWindow(window2, message) {
+    if (window2.finalized) return;
+    const hadConnection = Boolean(window2.socket) || window2.connecting || window2.ready;
+    if (window2.detached && !hadConnection) return;
+    this.closeSocket(window2);
+    for (const turn of window2.turns)
+      if (turn.status === "pending" || turn.status === "speaking") turn.status = "failed";
+    window2.localFifo = [];
+    window2.early.clear();
+    window2.partial.clear();
+    this.detach(window2);
+    this.emit({ type: "partial", lectureId: window2.lectureId, text: "" });
+    if (message && hadConnection) this.emit({ type: "error", lectureId: window2.lectureId, message });
+    this.updateFrontier(window2);
+    if (window2.closing) this.finalizeWindow(window2);
     void this.tick();
   }
-  liveStop(lectureId2) {
-    const state = this.live.get(lectureId2);
-    if (!state) return;
-    state.stopped = true;
-    if (!state.items.size && !state.sent.length) {
-      this.closeLive(state);
-      this.live.delete(lectureId2);
-    } else {
-      state.drainTimer = setTimeout(() => {
-        this.failLive(lectureId2, state);
-        this.live.delete(lectureId2);
-      }, 45e3);
-      state.drainTimer.unref();
+  /**
+   * Final accounting of a window: [frontier, end) minus finished turns becomes the gap list of its
+   * range task, which is then done (nothing missing) or queued for disk transcription right away.
+   */
+  finalizeWindow(window2) {
+    if (window2.finalized) return;
+    window2.finalized = true;
+    window2.closing ??= "stop";
+    if (window2.drainTimer) clearTimeout(window2.drainTimer);
+    window2.drainTimer = void 0;
+    this.closeSocket(window2);
+    for (const turn of window2.turns)
+      if (turn.status === "pending" || turn.status === "speaking") turn.status = "failed";
+    const endByte = window2.startByte + window2.bytes;
+    const frontier = Math.min(endByte, turnFrontier(window2.turns, window2.startByte));
+    const gaps = windowGaps(window2.turns, frontier, endByte);
+    this.sessions.delete(window2);
+    if (this.live.get(window2.lectureId) === window2) this.live.delete(window2.lectureId);
+    window2.partial.clear();
+    window2.early.clear();
+    window2.preReady = [];
+    try {
+      const task = this.task(window2.taskId);
+      if (task && !["cancelled", "done"].includes(task.status)) {
+        const payload = { ...task.payload, endByte, gaps, frontierByte: frontier, livePending: false };
+        this.store.taskUpdate(task.id, {
+          status: gaps.length ? "queued" : "done",
+          nextRun: this.now(),
+          error: null,
+          payload
+        });
+      }
+      if (!this.live.has(window2.lectureId)) this.emit({ type: "partial", lectureId: window2.lectureId, text: "" });
+      this.scheduleIncremental(window2.lectureId);
+      this.finalizeOriginal(window2.lectureId);
+      this.changed(window2.lectureId);
+    } catch {
     }
+    if (!this.stopped) void this.tick();
   }
 }
 class Credentials {
@@ -3200,27 +4679,6 @@ function safeError(error) {
   const text2 = error instanceof Error ? error.message : "Operation failed";
   return text2.replace(/sk-[A-Za-z0-9_-]+/g, "[redacted]").replace(/Bearer\s+\S+/gi, "Bearer [redacted]").slice(0, 1200);
 }
-const SAMPLE_RATE = 24e3;
-const BYTES_PER_SECOND = SAMPLE_RATE * 2;
-const SEGMENT_SECONDS = 10;
-function wavHeader(bytes) {
-  if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes % 2 || bytes > 4294967295 - 36)
-    throw new Error("Invalid PCM size");
-  const b = Buffer.alloc(44);
-  b.write("RIFF", 0);
-  b.writeUInt32LE(bytes + 36, 4);
-  b.write("WAVEfmt ", 8);
-  b.writeUInt32LE(16, 16);
-  b.writeUInt16LE(1, 20);
-  b.writeUInt16LE(1, 22);
-  b.writeUInt32LE(SAMPLE_RATE, 24);
-  b.writeUInt32LE(BYTES_PER_SECOND, 28);
-  b.writeUInt16LE(2, 32);
-  b.writeUInt16LE(16, 34);
-  b.write("data", 36);
-  b.writeUInt32LE(bytes, 40);
-  return b;
-}
 class RecordingService {
   constructor(store2, hooks) {
     this.store = store2;
@@ -3253,7 +4711,8 @@ class RecordingService {
       sequence: 0,
       start: 0,
       chunk: 0,
-      paused: false
+      paused: false,
+      total: 0
     };
     try {
       this.store.lectureSave({ id: lectureId2, status: "recording" });
@@ -3294,7 +4753,9 @@ class RecordingService {
         node_fs.fsyncSync(c.fd);
         c.bytes += length;
         consumed += length;
-        if (this.store.settings().liveTranscription) this.hooks.append(c.lectureId, slice);
+        const offset = c.total;
+        c.total += length;
+        if (this.store.settings().liveTranscription) this.hooks.append(c.lectureId, slice, offset);
         if (c.bytes === BYTES_PER_SECOND * SEGMENT_SECONDS) this.finalize(c);
       }
       c.chunk++;
@@ -3316,6 +4777,10 @@ class RecordingService {
     } catch (error) {
       this.interrupt(error instanceof Error ? error.message : "Could not finalize pause");
       throw error;
+    }
+    try {
+      this.hooks.pause(lectureId2);
+    } catch {
     }
   }
   resume(lectureId2) {
@@ -3425,7 +4890,7 @@ class RecordingService {
           end: start + (bytes - bytes % 2) / BYTES_PER_SECOND,
           path: wav,
           text: "",
-          status: "queued",
+          status: "audio",
           error: null
         };
         this.store.segmentSave(segment);
@@ -3433,8 +4898,9 @@ class RecordingService {
       }
     }
     for (const segment of known.values())
-      if (segment.status !== "done")
+      if (segment.status !== "done" && segment.status !== "audio")
         this.store.taskAdd("transcribe", lectureId2, { segmentId: segment.id }, `transcribe:${segment.id}`);
+    ensureCoverage(this.store, lectureId2);
     const duration = Math.max(0, ...[...known.values()].map((s) => s.end));
     this.store.lectureSave({ id: lectureId2, status: "ready", duration });
     this.store.gap(
@@ -3469,7 +4935,9 @@ class RecordingService {
       end: c.start + c.bytes / BYTES_PER_SECOND,
       path: wav,
       text: "",
-      status: "queued",
+      // Audio backup and playback only: transcript text comes from the continuous stream or the
+      // disk range fallback, never from fixed 10-second cuts.
+      status: "audio",
       error: null
     };
     this.store.segmentSave(segment);
@@ -3478,7 +4946,6 @@ class RecordingService {
     c.bytes = 0;
     c.partial = "";
     this.store.lectureSave({ id: c.lectureId, duration: c.start });
-    if (this.store.settings().liveTranscription) this.hooks.commit(c.lectureId, segment);
     this.hooks.emit({ type: "changed", lectureId: c.lectureId });
   }
   toWav(partial, bytes) {
@@ -3511,7 +4978,7 @@ class RecordingService {
   }
 }
 async function audioResponse(filename, range, head = false) {
-  const size = (await promises$1.stat(filename)).size;
+  const size = (await promises.stat(filename)).size;
   const headers = new Headers({ "Content-Type": "audio/wav", "Accept-Ranges": "bytes" });
   let start = 0, end = size - 1;
   if (range) {
@@ -3553,7 +5020,8 @@ const context = zod.z.object({
 const settingsSchema = zod.z.object({
   setupComplete: zod.z.boolean(),
   uiLanguage: language,
-  lectureLanguage: zod.z.enum(["ru", "uk", "en", "pl", "auto"]),
+  lectureLanguage: language,
+  lectureLanguageConfirmed: zod.z.boolean(),
   outputLanguage: language,
   theme: zod.z.enum(["light", "dark", "system"]),
   storageFolder: zod.z.string().max(4096),
@@ -3591,6 +5059,7 @@ const schemas = {
   "lecture.recover": lectureId,
   "lecture.trash": lectureId,
   "lecture.restore": lectureId,
+  "trash.empty": zod.z.object({}).strict(),
   "lecture.save": zod.z.object({
     id,
     subjectId: id.nullable().optional(),
@@ -3785,6 +5254,31 @@ async function saveSettings(patch) {
 function aiBusy() {
   return store.tasks().some((t) => t.status === "running" || t.status === "queued");
 }
+let emptyingTrash = false;
+async function emptyTrash() {
+  if (emptyingTrash) throw new Error("The trash is already being emptied");
+  const trashedIds = () => new Set(
+    store.snapshot().lectures.filter((l) => l.deletedAt).map((l) => l.id)
+  );
+  const trashed = trashedIds();
+  if (!trashed.size) return { count: 0 };
+  if (recording.active && trashed.has(recording.active))
+    throw new Error("Stop recording before emptying the trash");
+  if (store.snapshot().lectures.some((l) => trashed.has(l.id) && l.status === "importing") || store.materials().some((m) => m.lectureId && trashed.has(m.lectureId) && m.status === "processing"))
+    throw new Error("Wait for imports to finish before emptying the trash");
+  if (fileOperations || backupRunning)
+    throw new Error("Finish importing, exporting or backing up before emptying the trash");
+  emptyingTrash = true;
+  try {
+    for (const id2 of trashed) await ai.cancelLecture(id2);
+    if (fileOperations || backupRunning || movingLibrary)
+      throw new Error("Finish importing, exporting or backing up before emptying the trash");
+    for (const id2 of trashedIds()) if (!trashed.has(id2)) await ai.cancelLecture(id2);
+    return store.trashEmpty();
+  } finally {
+    emptyingTrash = false;
+  }
+}
 async function createWindow() {
   window = new electron.BrowserWindow({
     width: 1440,
@@ -3864,8 +5358,8 @@ async function boot() {
       store.lectureSave({ id: m.lectureId, status: "ready" });
   }
   recording = new RecordingService(store, {
-    append: (id2, pcm) => ai.liveAppend(id2, pcm),
-    commit: (id2, s) => ai.liveCommit(id2, s),
+    append: (id2, pcm, offset) => ai.liveAppend(id2, pcm, offset),
+    pause: (id2) => ai.livePause(id2),
     end: (id2) => {
       ai.liveStop(id2);
       ai.flush(id2);
@@ -3973,6 +5467,9 @@ async function boot() {
           break;
         case "lecture.restore":
           store.lectureRestore(a.lectureId);
+          break;
+        case "trash.empty":
+          result = await emptyTrash();
           break;
         case "lecture.recover":
           return recording.recover(a.lectureId);

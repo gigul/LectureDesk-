@@ -482,6 +482,12 @@ kbd {
   font-size: 25px;
   letter-spacing: -0.6px;
 }
+.library-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
 .library-heading > div > p {
   color: var(--muted);
   font-size: 11px;
@@ -854,6 +860,31 @@ kbd {
   margin-bottom: 17px;
   font-style: italic;
   line-height: 1.7;
+}
+/* A transcript fragment in another language: hidden from the transcript, audio kept. */
+.transcript-segment.rejected {
+  color: var(--muted);
+}
+.rejected-body {
+  flex: 1;
+  min-width: 0;
+}
+.rejected-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--danger);
+}
+.rejected-body details summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--muted);
+}
+.rejected-body details p {
+  font-size: 12px;
+  font-style: italic;
 }
 .live-label {
   display: flex;
@@ -1270,6 +1301,13 @@ kbd {
 }
 .notice-box svg {
   margin-top: 3px;
+}
+.notice-box.danger {
+  background: var(--danger-soft);
+  color: var(--text);
+}
+.notice-box.danger svg {
+  color: var(--danger);
 }
 .color-picker {
   display: flex;
@@ -2178,13 +2216,75 @@ kbd {
   border-bottom: 1px solid var(--line);
 }
 .chat-panel {
-  width: 345px;
+  /* --chat-width is set by the resize handle (clamped in App.tsx to leave room for the workspace). */
+  width: var(--chat-width, 345px);
   flex-shrink: 0;
   background: var(--panel);
   border-left: 1px solid var(--line);
   display: flex;
   flex-direction: column;
   min-height: 0;
+  position: relative;
+}
+.chat-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  /* Centered on the 1px border; kept narrow so the workspace scrollbar stays easy to grab. */
+  left: -3px;
+  width: 8px;
+  cursor: col-resize;
+  touch-action: none;
+  z-index: 10;
+  outline: none;
+}
+.chat-resize-handle::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 1px;
+  background: transparent;
+  transition:
+    background 0.15s,
+    width 0.15s,
+    left 0.15s;
+}
+.chat-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 1px;
+  width: 5px;
+  height: 34px;
+  margin-top: -17px;
+  border-radius: 3px;
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.chat-resize-handle:hover::before,
+.chat-resize-handle.dragging::before,
+.chat-resize-handle:focus-visible::before {
+  left: 2px;
+  width: 3px;
+  background: var(--accent);
+}
+.chat-resize-handle:hover::after,
+.chat-resize-handle.dragging::after,
+.chat-resize-handle:focus-visible::after {
+  opacity: 1;
+}
+.chat-resize-handle:focus-visible::after {
+  box-shadow:
+    0 0 0 2px var(--panel),
+    0 0 0 4px var(--accent);
+}
+body.chat-resizing,
+body.chat-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
 }
 .chat-header {
   height: 70px;
@@ -2795,9 +2895,6 @@ kbd {
   }
   .lecture-list {
     width: 215px;
-  }
-  .chat-panel {
-    width: 310px;
   }
   .chat-open .lecture-list {
     width: 165px;

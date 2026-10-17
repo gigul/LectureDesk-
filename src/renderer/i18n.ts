@@ -88,7 +88,7 @@ const en = {
   bothWarning:
     'Using speakers and a microphone may capture the same audio twice. Headphones help prevent echo.',
   playbackSpeed: 'Playback speed',
-  segmentTiming: 'Timestamps identify audio segments; they are not word-level alignment.',
+  segmentTiming: 'Timestamps mark the start of each spoken phrase; they are not word-level alignment.',
   liveText: 'Preliminary text',
   liveTranscription: 'Live transcription',
   liveTranslation: 'Live translation',
@@ -306,6 +306,26 @@ const en = {
   attachmentScope: 'Import into',
   duration: 'Duration',
   never: 'Never',
+  autoLectureName: 'Lecture',
+  clearTrash: 'Empty trash',
+  clearTrashConfirmTitle: 'Permanently empty the trash?',
+  clearTrashConfirmBody:
+    'Lectures in the trash: {count}. Their audio, transcripts, notes and attachments will be permanently deleted from this computer. They cannot be restored.',
+  clearTrashConfirm: 'Delete permanently',
+  clearTrashDone: 'Trash emptied. Lectures deleted: {count}',
+  clearTrashBlocked: 'Wait for imports in the trash to finish',
+  resizeChat: 'Resize chat panel',
+  resizeChatHint: 'Drag or use the arrow keys to resize. Double-click to reset.',
+  languageRejected: 'Not in the lecture language or English — hidden from the transcript. The audio is kept.',
+  languageRejectedRaw: 'Recognized text',
+  liveModeServer: 'Phrase boundaries are detected by OpenAI (server-side turn detection).',
+  liveModeLocal:
+    'This model has no server-side turn detection: LectureDesk ends phrases at pauses it detects itself.',
+  lectureLanguageHint: 'Transcripts contain only this language and English.',
+  lectureLanguagePromptTitle: 'Choose the language of your lectures',
+  lectureLanguagePromptBody:
+    'Automatic detection is no longer used. Transcripts will contain only this language and English; fragments in other languages are hidden and their audio is kept. You can change it later in Settings.',
+  confirmLanguage: 'Use this language',
 };
 export type TextKey = keyof typeof en;
 const ru: Record<TextKey, string> = {
@@ -390,7 +410,7 @@ const ru: Record<TextKey, string> = {
   level: 'Уровень звука',
   bothWarning: 'Динамики и микрофон могут записать один звук дважды. Наушники помогают избежать эха.',
   playbackSpeed: 'Скорость воспроизведения',
-  segmentTiming: 'Метки времени относятся к аудиофрагментам, а не к отдельным словам.',
+  segmentTiming: 'Метки времени отмечают начало каждой фразы, а не отдельных слов.',
   liveText: 'Предварительный текст',
   liveTranscription: 'Распознавание в реальном времени',
   liveTranslation: 'Перевод во время записи',
@@ -607,6 +627,26 @@ const ru: Record<TextKey, string> = {
   attachmentScope: 'Импортировать в',
   duration: 'Длительность',
   never: 'Никогда',
+  autoLectureName: 'Лекция',
+  clearTrash: 'Очистить корзину',
+  clearTrashConfirmTitle: 'Очистить корзину навсегда?',
+  clearTrashConfirmBody:
+    'Лекций в корзине: {count}. Их аудио, транскрипты, заметки и вложения будут навсегда удалены с этого компьютера. Восстановить их будет невозможно.',
+  clearTrashConfirm: 'Удалить навсегда',
+  clearTrashDone: 'Корзина очищена. Удалено лекций: {count}',
+  clearTrashBlocked: 'Дождитесь окончания импорта лекций в корзине',
+  resizeChat: 'Изменить ширину чата',
+  resizeChatHint: 'Перетащите или используйте стрелки. Двойной щелчок — исходная ширина.',
+  languageRejected: 'Не на языке лекции и не на английском — скрыто из транскрипта. Аудио сохранено.',
+  languageRejectedRaw: 'Распознанный текст',
+  liveModeServer: 'Границы фраз определяет OpenAI (определение реплик на сервере).',
+  liveModeLocal:
+    'У этой модели нет определения реплик на сервере: LectureDesk завершает фразы на паузах, которые находит сам.',
+  lectureLanguageHint: 'Транскрипт будет содержать только этот язык и английский.',
+  lectureLanguagePromptTitle: 'Выберите язык ваших лекций',
+  lectureLanguagePromptBody:
+    'Автоопределение больше не используется. Транскрипт будет содержать только этот язык и английский; фрагменты на других языках скрываются, а их аудио сохраняется. Язык можно изменить в настройках.',
+  confirmLanguage: 'Выбрать этот язык',
 };
 const uk: Record<TextKey, string> = {
   ...ru,
@@ -1076,6 +1116,26 @@ const pl: Record<TextKey, string> = {
   attachmentScope: 'Importuj do',
   duration: 'Czas trwania',
   never: 'Nigdy',
+  autoLectureName: 'Wykład',
+  clearTrash: 'Opróżnij kosz',
+  clearTrashConfirmTitle: 'Opróżnić kosz na zawsze?',
+  clearTrashConfirmBody:
+    'Wykłady w koszu: {count}. Ich nagrania audio, transkrypcje, notatki i załączniki zostaną trwale usunięte z tego komputera. Nie będzie można ich przywrócić.',
+  clearTrashConfirm: 'Usuń na zawsze',
+  clearTrashDone: 'Kosz opróżniony. Usunięte wykłady: {count}',
+  clearTrashBlocked: 'Poczekaj na zakończenie importu wykładów w koszu',
+  resizeChat: 'Zmień szerokość czatu',
+  resizeChatHint: 'Przeciągnij lub użyj strzałek. Dwuklik przywraca domyślną szerokość.',
+  languageRejected: 'Nie w języku wykładu ani po angielsku — ukryte w transkrypcji. Nagranie zachowano.',
+  languageRejectedRaw: 'Rozpoznany tekst',
+  liveModeServer: 'Granice wypowiedzi wykrywa OpenAI (wykrywanie tur po stronie serwera).',
+  liveModeLocal:
+    'Ten model nie wykrywa tur po stronie serwera: LectureDesk kończy wypowiedzi na pauzach wykrytych lokalnie.',
+  lectureLanguageHint: 'Transkrypcja będzie zawierać tylko ten język i angielski.',
+  lectureLanguagePromptTitle: 'Wybierz język swoich wykładów',
+  lectureLanguagePromptBody:
+    'Automatyczne wykrywanie nie jest już używane. Transkrypcja będzie zawierać tylko ten język i angielski; fragmenty w innych językach są ukrywane, a ich nagranie zostaje zachowane. Język można zmienić w ustawieniach.',
+  confirmLanguage: 'Użyj tego języka',
 };
 const catalogs = { en, ru, uk, pl };
 Object.assign(uk, {
@@ -1099,7 +1159,7 @@ Object.assign(uk, {
   bothWarning:
     'Динаміки та мікрофон можуть записати один звук двічі. Навушники допомагають уникнути відлуння.',
   playbackSpeed: 'Швидкість відтворення',
-  segmentTiming: 'Позначки часу стосуються аудіофрагментів, а не окремих слів.',
+  segmentTiming: 'Позначки часу вказують на початок кожної фрази, а не окремих слів.',
   liveText: 'Попередній текст',
   cancelled: 'Скасовано',
   cancelTask: 'Скасувати завдання',
@@ -1201,12 +1261,32 @@ Object.assign(uk, {
   attachmentScope: 'Імпортувати до',
   duration: 'Тривалість',
   never: 'Ніколи',
+  autoLectureName: 'Лекція',
+  clearTrash: 'Очистити кошик',
+  clearTrashConfirmTitle: 'Очистити кошик назавжди?',
+  clearTrashConfirmBody:
+    'Лекцій у кошику: {count}. Їхні аудіо, транскрипти, нотатки та вкладення буде назавжди видалено з цього комп’ютера. Відновити їх буде неможливо.',
+  clearTrashConfirm: 'Видалити назавжди',
+  clearTrashDone: 'Кошик очищено. Видалено лекцій: {count}',
+  clearTrashBlocked: 'Дочекайтеся завершення імпорту лекцій у кошику',
+  resizeChat: 'Змінити ширину чату',
+  resizeChatHint: 'Перетягніть або скористайтеся стрілками. Подвійне клацання — початкова ширина.',
+  languageRejected: 'Не мовою лекції й не англійською — приховано з транскрипту. Аудіо збережено.',
+  languageRejectedRaw: 'Розпізнаний текст',
+  liveModeServer: 'Межі фраз визначає OpenAI (визначення реплік на сервері).',
+  liveModeLocal:
+    'Ця модель не має визначення реплік на сервері: LectureDesk завершує фрази на паузах, які знаходить сам.',
+  lectureLanguageHint: 'Транскрипт міститиме лише цю мову та англійську.',
+  lectureLanguagePromptTitle: 'Виберіть мову ваших лекцій',
+  lectureLanguagePromptBody:
+    'Автовизначення більше не використовується. Транскрипт міститиме лише цю мову та англійську; фрагменти іншими мовами приховуються, а їхнє аудіо зберігається. Мову можна змінити в налаштуваннях.',
+  confirmLanguage: 'Вибрати цю мову',
 } satisfies Partial<Record<TextKey, string>>);
 Object.assign(pl, {
   help: 'Skróty klawiszowe',
   chat: 'Zapytaj o materiały',
   playbackSpeed: 'Prędkość odtwarzania',
-  segmentTiming: 'Znaczniki czasu wskazują fragmenty audio, nie poszczególne słowa.',
+  segmentTiming: 'Znaczniki czasu wskazują początek każdej wypowiedzi, nie poszczególne słowa.',
   liveText: 'Tekst wstępny',
   ocr: 'OCR',
   fileSize: 'Rozmiar pliku',

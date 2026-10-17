@@ -17,6 +17,7 @@ import { randomUUID } from 'node:crypto';
 import type { Store } from './store';
 import type { AudioMode, AppEvent, Segment } from '../shared/types';
 import { wavHeader, BYTES_PER_SECOND, SEGMENT_SECONDS } from './audio-format';
+import { ensureCoverage } from './transcript-coverage';
 
 type Capture = {
   lectureId: string;
@@ -29,10 +30,14 @@ type Capture = {
   start: number;
   chunk: number;
   paused: boolean;
+  /** Lecture timeline position (bytes) of the next durable byte; continuous across pauses. */
+  total: number;
 };
 export interface RecordingHooks {
-  append(lectureId: string, pcm: Buffer): void;
-  commit(lectureId: string, segment: Segment): void;
+  /** Durable PCM slice at lecture byte `offsetBytes` (live transcription stream). */
+  append(lectureId: string, pcm: Buffer, offsetBytes: number): void;
+  /** Recording paused after the pause tail was finalized. */
+  pause(lectureId: string): void;
   end(lectureId: string): void;
   emit(event: AppEvent): void;
   wake(active: boolean): void;
@@ -70,6 +75,7 @@ export class RecordingService {
       start: 0,
       chunk: 0,
       paused: false,
+      total: 0,
     };
     try {
       this.store.lectureSave({ id: lectureId, status: 'recording' });
@@ -110,8 +116,10 @@ export class RecordingService {
         fsyncSync(c.fd);
         c.bytes += length;
         consumed += length;
+        const offset = c.total;
+        c.total += length;
         // Append only durable bytes to the network; losing connectivity cannot affect the disk path.
-        if (this.store.settings().liveTranscription) this.hooks.append(c.lectureId, slice);
+        if (this.store.settings().liveTranscription) this.hooks.append(c.lectureId, slice, offset);
         if (c.bytes === BYTES_PER_SECOND * SEGMENT_SECONDS) this.finalize(c);
       }
       c.chunk++;
@@ -133,6 +141,11 @@ export class RecordingService {
     } catch (error) {
       this.interrupt(error instanceof Error ? error.message : 'Could not finalize pause');
       throw error;
+    }
+    try {
+      this.hooks.pause(lectureId);
+    } catch {
+      // Live transcription is optional; the disk fallback covers audio of an unclosed window.
     }
   }
   resume(lectureId: string) {
@@ -246,16 +259,19 @@ export class RecordingService {
           end: start + (bytes - (bytes % 2)) / BYTES_PER_SECOND,
           path: wav,
           text: '',
-          status: 'queued',
+          status: 'audio',
           error: null,
         };
         this.store.segmentSave(segment);
         known.set(sequence, segment);
       }
     }
+    // Segments of recordings made by earlier versions keep their per-segment transcription.
     for (const segment of known.values())
-      if (segment.status !== 'done')
+      if (segment.status !== 'done' && segment.status !== 'audio')
         this.store.taskAdd('transcribe', lectureId, { segmentId: segment.id }, `transcribe:${segment.id}`);
+    // Recovered audio that no realtime window accounted for is transcribed from disk.
+    ensureCoverage(this.store, lectureId);
     const duration = Math.max(0, ...[...known.values()].map((s) => s.end));
     this.store.lectureSave({ id: lectureId, status: 'ready', duration });
     this.store.gap(
@@ -290,7 +306,9 @@ export class RecordingService {
       end: c.start + c.bytes / BYTES_PER_SECOND,
       path: wav,
       text: '',
-      status: 'queued',
+      // Audio backup and playback only: transcript text comes from the continuous stream or the
+      // disk range fallback, never from fixed 10-second cuts.
+      status: 'audio',
       error: null,
     };
     this.store.segmentSave(segment);
@@ -299,7 +317,6 @@ export class RecordingService {
     c.bytes = 0;
     c.partial = '';
     this.store.lectureSave({ id: c.lectureId, duration: c.start });
-    if (this.store.settings().liveTranscription) this.hooks.commit(c.lectureId, segment);
     this.hooks.emit({ type: 'changed', lectureId: c.lectureId });
   }
   private toWav(partial: string, bytes: number) {

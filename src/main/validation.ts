@@ -23,7 +23,8 @@ export const settingsSchema = z
   .object({
     setupComplete: z.boolean(),
     uiLanguage: language,
-    lectureLanguage: z.enum(['ru', 'uk', 'en', 'pl', 'auto']),
+    lectureLanguage: language,
+    lectureLanguageConfirmed: z.boolean(),
     outputLanguage: language,
     theme: z.enum(['light', 'dark', 'system']),
     storageFolder: z.string().max(4096),
@@ -68,6 +69,7 @@ const schemas: Partial<Record<Method, z.ZodType>> = {
   'lecture.recover': lectureId,
   'lecture.trash': lectureId,
   'lecture.restore': lectureId,
+  'trash.empty': z.object({}).strict(),
   'lecture.save': z
     .object({
       id,

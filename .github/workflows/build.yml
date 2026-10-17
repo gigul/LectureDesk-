@@ -1,0 +1,92 @@
+name: Build installers
+
+# Unsigned development installers for every supported CPU, each built on a native runner:
+# native optional dependencies (@ffmpeg-installer/<os>-<arch>, @napi-rs/canvas-<os>-<arch>) are
+# installed only for the runner's own OS and CPU, so cross-arch packaging would ship the wrong binaries.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64 (Apple Silicon)
+            runner: macos-15
+            arch: arm64
+            script: dist:mac:arm64
+            artifact: mac-arm64
+          - name: macOS x64 (Intel)
+            runner: macos-15-intel
+            arch: x64
+            script: dist:mac:x64
+            artifact: mac-x64
+          - name: Windows x64
+            runner: windows-latest
+            arch: x64
+            script: dist:win
+            artifact: windows-x64
+    env:
+      # No signing credentials exist; never pick up a random keychain identity.
+      CSC_IDENTITY_AUTO_DISCOVERY: false
+    defaults:
+      run:
+        # bash on every runner, so `npm run <script> -- --publish never` and the checks below behave the same.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Check runner CPU
+        run: |
+          actual="$(node -p process.arch)"
+          echo "Node $(node -v) ${actual} on ${RUNNER_OS} ${RUNNER_ARCH}"
+          if [ "$actual" != "${{ matrix.arch }}" ]; then
+            echo "::error::This job packages ${{ matrix.arch }} but the runner's Node is ${actual}; native dependencies would not match."
+            exit 1
+          fi
+
+      - run: npm ci
+
+      - run: npm run resources
+
+      - name: Generate icons if missing
+        run: |
+          if [ ! -f build/icon.png ] || { [ "$RUNNER_OS" = macOS ] && [ ! -f build/icon.icns ]; }; then
+            npm run icon
+          else
+            echo "build/icon.* are committed; skipping npm run icon"
+          fi
+
+      # typecheck + tests + build. On Windows the symlink test in tests/portability.test.ts needs the
+      # symbolic-link privilege; GitHub's Windows runners run as administrator, which has it.
+      - name: Verify
+        run: npm run verify
+
+      # The afterPack hook (scripts/check-native-binaries.cjs) fails this step if the packaged app
+      # lacks FFmpeg / PDF canvas binaries compiled for the job's OS and CPU.
+      - name: Package
+        run: npm run ${{ matrix.script }} -- --publish never
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: LectureDesk-${{ matrix.artifact }}
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.exe
+          if-no-files-found: error
+          retention-days: 30

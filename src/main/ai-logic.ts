@@ -1,30 +1,18 @@
 import { createHash } from 'node:crypto';
-import type { Segment } from '../shared/types';
+import type { Segment, TranscriptItem } from '../shared/types';
+import { renderTranscript, timeLabel, transcriptUnits, finalizedUnits } from '../shared/transcript';
 import { APIError } from './ai-provider';
 
+export { timeLabel, finalizedUnits };
 export const words = (text: string) => text.match(/[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu)?.length ?? 0;
 export const sentenceComplete = (text: string) => /[.!?…。！？][\s\p{Pe}"'»”]*$/u.test(text.trim());
 export const digest = (data: unknown) => createHash('sha256').update(JSON.stringify(data)).digest('hex');
-export function timeLabel(seconds: number) {
-  const value = Math.max(0, Math.floor(seconds));
-  return value >= 3600
-    ? `${Math.floor(value / 3600)}:${String(Math.floor((value % 3600) / 60)).padStart(2, '0')}:${String(value % 60).padStart(2, '0')}`
-    : `${Math.floor(value / 60)}:${String(value % 60).padStart(2, '0')}`;
-}
-export function orderedTranscript(segments: Segment[]) {
-  return [...segments]
-    .sort((a, b) => a.sequence - b.sequence)
-    .filter((s) => s.status === 'done')
-    .map((s) => `[${timeLabel(s.start)}] ${s.text}`)
-    .join('\n\n');
-}
-export function finalizedPrefix(segments: Segment[]) {
-  const result: Segment[] = [];
-  for (const segment of [...segments].sort((a, b) => a.sequence - b.sequence)) {
-    if (segment.status !== 'done') break;
-    result.push(segment);
-  }
-  return result;
+/**
+ * Finalized transcript text in time order: accepted transcript items merged with legacy segment
+ * text. For segment-only (legacy) lectures the output is identical to the per-segment format.
+ */
+export function orderedTranscript(segments: Segment[], items: TranscriptItem[] = []) {
+  return renderTranscript(transcriptUnits(segments, items));
 }
 /** No heuristic boundary deletion: independent, non-overlapping files preserve genuine repetitions. */
 export function textSections(text: string, limit = 14000) {

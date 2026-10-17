@@ -16,7 +16,7 @@ function fixture() {
   const lecture = store.lectureCreate({ title: 'Real persistence test' });
   const hooks: RecordingHooks = {
     append: () => {},
-    commit: () => {},
+    pause: () => {},
     end: () => {},
     emit: () => {},
     wake: () => {},
@@ -78,12 +78,55 @@ describe('durable audio capture', () => {
     expect(detail.lecture.status).toBe('ready');
     expect(detail.lecture.duration).toBe(2);
     expect(detail.segments).toHaveLength(1);
-    expect(detail.segments[0].status).toBe('queued');
-    expect(store.tasks()[0].payload.segmentId).toBe(detail.segments[0].id);
+    // Recorded audio is backup/playback only; one disk range task transcribes it.
+    expect(detail.segments[0].status).toBe('audio');
+    expect(store.tasks()).toHaveLength(1);
+    expect(store.tasks()[0]).toMatchObject({
+      kind: 'transcribe-range',
+      status: 'queued',
+      payload: { startByte: 0, endByte: BYTES_PER_SECOND * 2, origin: 'reconcile', livePending: false },
+    });
     service.recover(lecture.id);
     expect(store.lectureGet(lecture.id).segments).toHaveLength(1);
     expect(store.tasks()).toHaveLength(1);
     expect(readdirSync(join(store.root, 'audio', lecture.id)).some((n) => n.endsWith('.part'))).toBe(false);
+  });
+  it('streams contiguous lecture offsets across segments and pauses, and closes live at pause', () => {
+    const { store, lecture } = fixture();
+    store.saveSettings({ liveTranscription: true });
+    const appended: [number, number][] = [];
+    const paused: string[] = [];
+    const service = new RecordingService(store, {
+      append: (_, pcm, offset) => appended.push([offset, pcm.length]),
+      pause: (id) => paused.push(id),
+      end: () => {},
+      emit: () => {},
+      wake: () => {},
+    });
+    service.start(lecture.id, 'microphone');
+    const batch = ab(Buffer.alloc(BYTES_PER_SECOND * 2, 3));
+    for (let i = 0; i < 6; i++) service.chunk(lecture.id, i, batch); // 12 s: crosses the 10 s file boundary
+    service.pause(lecture.id);
+    expect(paused).toEqual([lecture.id]);
+    service.resume(lecture.id);
+    service.chunk(lecture.id, 6, ab(Buffer.alloc(BYTES_PER_SECOND / 2, 3)));
+    service.stop(lecture.id);
+    // Every durable byte is appended exactly once, at its position on the lecture timeline.
+    let expected = 0;
+    for (const [offset, length] of appended) {
+      expect(offset).toBe(expected);
+      expected += length;
+    }
+    expect(expected).toBe(BYTES_PER_SECOND * 12.5);
+    const detail = store.lectureGet(lecture.id);
+    expect(detail.segments.map((s) => [s.start, s.end, s.status])).toEqual([
+      [0, 10, 'audio'],
+      [10, 12, 'audio'],
+      [12, 12.5, 'audio'],
+    ]);
+    expect(detail.segments.every((s) => s.text === '')).toBe(true);
+    // Capture itself queues no transcription; the AI layer owns live windows and disk ranges.
+    expect(store.tasks()).toHaveLength(0);
   });
   it('refuses overwriting existing audio and marks missing batches honestly', () => {
     const { store, lecture, service } = fixture();

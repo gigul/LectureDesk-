@@ -13,12 +13,18 @@ asarUnpack:
 extraResources:
   - from: resources
     to: resources
+# Fails the build when the packaged app lacks FFmpeg / @napi-rs/canvas binaries for the target OS and CPU.
+afterPack: ./scripts/check-native-binaries.cjs
 mac:
+  # Supported Mac CPUs: arm64 (Apple Silicon) and x64 (Intel), one DMG + ZIP per CPU.
+  # The arch is deliberately NOT listed here: electron-builder adds config archs to CLI archs,
+  # so `arch: [arm64, x64]` would make `--mac --x64` build arm64 too, with the wrong native
+  # optional dependencies. Choose the CPU on the command line (npm run dist:mac:arm64 / dist:mac:x64);
+  # without a CPU flag the arch of the Node.js running the build is used.
   target:
-    - target: dmg
-      arch: arm64
-    - target: zip
-      arch: arm64
+    - dmg
+    - zip
+  artifactName: LectureDesk-${version}-mac-${arch}.${ext}
   category: public.app-category.education
   minimumSystemVersion: '15.0'
   hardenedRuntime: true
@@ -38,5 +44,5 @@ nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
-  artifactName: LectureDesk-${version}-windows-x64-setup.${ext}
+  artifactName: LectureDesk-${version}-windows-${arch}-setup.${ext}
 publish: null

@@ -145,6 +145,43 @@ async function saveSettings(patch: Partial<Settings>) {
 function aiBusy() {
   return store.tasks().some((t) => t.status === 'running' || t.status === 'queued');
 }
+let emptyingTrash = false;
+/** Permanently deletes every lecture in Trash after stopping the AI work queued for them. */
+async function emptyTrash(): Promise<{ count: number }> {
+  if (emptyingTrash) throw new Error('The trash is already being emptied');
+  const trashedIds = () =>
+    new Set(
+      store
+        .snapshot()
+        .lectures.filter((l) => l.deletedAt)
+        .map((l) => l.id),
+    );
+  const trashed = trashedIds();
+  if (!trashed.size) return { count: 0 };
+  if (recording.active && trashed.has(recording.active))
+    throw new Error('Stop recording before emptying the trash');
+  if (
+    store.snapshot().lectures.some((l) => trashed.has(l.id) && l.status === 'importing') ||
+    store.materials().some((m) => m.lectureId && trashed.has(m.lectureId) && m.status === 'processing')
+  )
+    throw new Error('Wait for imports to finish before emptying the trash');
+  // Exports and backups read lecture files; deleting them midway would fail those operations.
+  if (fileOperations || backupRunning)
+    throw new Error('Finish importing, exporting or backing up before emptying the trash');
+  emptyingTrash = true;
+  try {
+    // Aborted requests settle asynchronously; wait until they have observed the cancellation while
+    // their task rows still exist, so they finish quietly instead of reporting a failure.
+    for (const id of trashed) await ai.cancelLecture(id);
+    if (fileOperations || backupRunning || movingLibrary)
+      throw new Error('Finish importing, exporting or backing up before emptying the trash');
+    // Lectures trashed while waiting are deleted too; cancel their work first.
+    for (const id of trashedIds()) if (!trashed.has(id)) await ai.cancelLecture(id);
+    return store.trashEmpty();
+  } finally {
+    emptyingTrash = false;
+  }
+}
 
 async function createWindow() {
   window = new BrowserWindow({
@@ -228,8 +265,8 @@ async function boot() {
       store.lectureSave({ id: m.lectureId, status: 'ready' });
   }
   recording = new RecordingService(store, {
-    append: (id, pcm) => ai.liveAppend(id, pcm),
-    commit: (id, s) => ai.liveCommit(id, s),
+    append: (id, pcm, offset) => ai.liveAppend(id, pcm, offset),
+    pause: (id) => ai.livePause(id),
     end: (id) => {
       ai.liveStop(id);
       ai.flush(id);
@@ -353,6 +390,9 @@ async function boot() {
           break;
         case 'lecture.restore':
           store.lectureRestore(a.lectureId);
+          break;
+        case 'trash.empty':
+          result = await emptyTrash();
           break;
         case 'lecture.recover':
           return recording.recover(a.lectureId);

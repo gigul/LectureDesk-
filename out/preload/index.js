@@ -10,6 +10,7 @@ const METHODS = [
   "lecture.trash",
   "lecture.restore",
   "lecture.recover",
+  "trash.empty",
   "version.save",
   "version.activate",
   "settings.save",

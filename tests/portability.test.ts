@@ -5,6 +5,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import archiver from 'archiver';
 import yauzl from 'yauzl';
+import { DatabaseSync } from 'node:sqlite';
 import { Store } from '../src/main/store.js';
 import { Portability, safeArchivePath } from '../src/main/portability.js';
 
@@ -357,6 +358,123 @@ describe('verified portable archives and atomic backups', () => {
     expect(store.lectureGet(newId).lecture.status).toBe('interrupted');
     expect(await fs.readFile(path.join(store.root, 'audio', newId, '000000-0.pcm.part'))).toEqual(tail);
     expect(store.snapshot().recoverable.map((item) => item.id)).toContain(newId);
+  });
+  it('restores a backup made by a version-one library into the current version and purges restored trash', async () => {
+    const data = await sample();
+    store.lectureTrash(data.lecture.id);
+    // Recreate the version-one schema: every original deletion blocked, user_version 1.
+    store.db.exec(
+      "DROP TRIGGER original_delete; CREATE TRIGGER original_delete BEFORE DELETE ON versions WHEN OLD.kind='original' BEGIN SELECT RAISE(ABORT,'Original transcripts are immutable'); END; PRAGMA user_version=1;",
+    );
+    const folder = path.join(directory, 'backups');
+    await fs.mkdir(folder);
+    const backup = await portability.backup(folder, true, 5);
+    const snapshotFile = path.join(directory, 'snapshot.sqlite');
+    await fs.writeFile(snapshotFile, (await entries(backup.path)).get('library.sqlite')!);
+    const snapshot = new DatabaseSync(snapshotFile, { readOnly: true });
+    expect(snapshot.prepare('PRAGMA user_version').get()).toMatchObject({ user_version: 1 });
+    snapshot.close();
+    store.close();
+    store = new Store(path.join(directory, 'library'));
+    portability = new Portability(store);
+    expect(store.db.prepare('PRAGMA user_version').get()).toMatchObject({ user_version: 3 });
+    const restored = await portability.restore(backup.path);
+    const id = restored.lectureIds[0];
+    const detail = store.lectureGet(id);
+    expect(detail.lecture.deletedAt).not.toBeNull();
+    expect(detail.versions.find((version) => version.kind === 'original')?.content).toBe(
+      data.original.content,
+    );
+    const restoredFiles = [...detail.segments, ...detail.materials].map((item) => item.path);
+    for (const file of restoredFiles) expect(file.startsWith(path.join(store.root, 'restored'))).toBe(true);
+    store.lecturePurge(id);
+    expect(() => store.lectureGet(id)).toThrow(/does not exist/);
+    for (const file of restoredFiles) await expect(fs.access(file)).rejects.toThrow();
+    // The lecture the backup was made from keeps its own files and immutable original.
+    expect(store.lectureGet(data.lecture.id).versions.find((v) => v.kind === 'original')?.id).toBe(
+      data.original.id,
+    );
+    expect(await fs.readFile(data.segment.path, 'utf8')).toBe('original-audio-bytes');
+    expect(await fs.readFile(data.material.path, 'utf8')).toBe('Матеріали');
+    // A backup of the migrated library still restores (schema-independent archive data).
+    const second = await portability.backup(folder, true, 5);
+    expect((await portability.restore(second.path)).lectureIds).toHaveLength(1);
+  });
+  it('round-trips transcript items with remapped lecture and range task references', async () => {
+    const data = await sample();
+    const range = store.taskAdd('transcribe-range', data.lecture.id, {
+      startByte: 0,
+      endByte: 480000,
+      livePending: false,
+      chunks: [{ startByte: 0, endByte: 480000, silent: false, voicedMs: 9000 }],
+    });
+    const item = {
+      lectureId: data.lecture.id,
+      start: 0.5,
+      end: 9.5,
+      text: 'Термодинаміка вивчає енергію.',
+      status: 'done' as const,
+      source: 'file' as const,
+      model: 'gpt-transcribe',
+      language: 'uk',
+      error: null,
+      sourceKey: `range:${range.id}:0`,
+    };
+    store.itemSave(item);
+    store.itemSave({ ...item, start: 10, end: 12, text: '中文', status: 'rejected', error: 'Not Ukrainian', sourceKey: 'live:w:i' });
+    const filename = path.join(directory, 'items.ldlecture');
+    await portability.exportLecture(data.lecture.id, undefined, 'package', filename);
+    const archived = JSON.parse((await entries(filename)).get('data.json')!.toString());
+    expect(archived.schema).toBe(2);
+    expect(archived.tables.transcript_items).toHaveLength(2);
+    const imported = await portability.importPackage(filename);
+    const id = imported.lectureIds[0];
+    const items = store.lectureGet(id).items;
+    expect(items.map((row) => [row.lectureId, row.text, row.status])).toEqual([
+      [id, item.text, 'done'],
+      [id, '中文', 'rejected'],
+    ]);
+    const restoredRange = store.tasks().find((task) => task.lectureId === id && task.kind === 'transcribe-range')!;
+    // The saved chunk result still belongs to the (remapped) task, so resuming never repeats it.
+    expect(items[0].sourceKey).toBe(`range:${restoredRange.id}:0`);
+    expect(store.lectureGet(data.lecture.id).items).toHaveLength(2);
+  });
+  it('restores schema-1 archives that predate transcript items', async () => {
+    const data = await sample();
+    const filename = path.join(directory, 'old.ldlecture');
+    await portability.exportLecture(data.lecture.id, undefined, 'package', filename);
+    const contents = await entries(filename);
+    const archived = JSON.parse(contents.get('data.json')!.toString());
+    archived.schema = 1;
+    delete archived.tables.transcript_items;
+    const json = Buffer.from(JSON.stringify(archived));
+    contents.set('data.json', json);
+    const manifest = JSON.parse(contents.get('manifest.json')!.toString());
+    const { createHash } = await import('node:crypto');
+    for (const entry of manifest.entries)
+      if (entry.path === 'data.json') {
+        entry.size = json.length;
+        entry.sha256 = createHash('sha256').update(json).digest('hex');
+      }
+    contents.set('manifest.json', Buffer.from(JSON.stringify(manifest)));
+    const old = path.join(directory, 'old-rebuilt.ldlecture');
+    await zipEntries(old, contents);
+    const imported = await portability.importPackage(old);
+    const detail = store.lectureGet(imported.lectureIds[0]);
+    expect(detail.items).toEqual([]);
+    expect(detail.versions.find((v) => v.kind === 'original')?.content).toBe(data.original.content);
+  });
+  it('cancels disk transcription of restored lectures whose audio was excluded', async () => {
+    const data = await sample();
+    const range = store.taskAdd('transcribe-range', data.lecture.id, { startByte: 0, endByte: 480000 });
+    store.taskUpdate(range.id, { nextRun: Number.MAX_SAFE_INTEGER, payload: { ...range.payload, livePending: true } });
+    const folder = path.join(directory, 'backups');
+    await fs.mkdir(folder);
+    const backup = await portability.backup(folder, false, 5);
+    const restored = await portability.restore(backup.path);
+    const task = store.tasks().find((t) => t.lectureId === restored.lectureIds[0] && t.kind === 'transcribe-range')!;
+    expect(task).toMatchObject({ status: 'cancelled', error: 'Audio was excluded from this backup' });
+    expect(task.payload.livePending).toBe(false);
   });
   it('refuses a recording snapshot rather than silently omitting the active audio tail', async () => {
     const lecture = store.lectureCreate();

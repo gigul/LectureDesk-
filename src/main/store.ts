@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, realpathSync, lstatSync, rmSync, rmdirSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
@@ -8,6 +8,7 @@ import {
   type Subject,
   type Lecture,
   type Segment,
+  type TranscriptItem,
   type Version,
   type Material,
   type Task,
@@ -20,8 +21,11 @@ import {
   type Usage,
   type LectureDetail,
 } from '../shared/types.js';
+import { localIsoDate } from '../shared/naming.js';
 
 const now = () => new Date().toISOString();
+/** Top-level folders of the library root that hold lecture files (never the database or credentials). */
+const LIBRARY_CONTENT = ['audio', 'lectures', 'materials', 'restored'];
 const jsonFields = new Set(['tags', 'parameters', 'pages', 'payload', 'context', 'sources', 'data']);
 function decode<T>(row: Record<string, unknown> | undefined): T | undefined {
   if (!row) return undefined;
@@ -53,7 +57,12 @@ export class Store {
     this.db.exec(
       'PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;',
     );
-    this.migrate();
+    try {
+      this.migrate();
+    } catch (error) {
+      this.db.close(); // Release the file so the user can move or replace the library.
+      throw error;
+    }
     // Operations persisted before a crash remain queued; recordings require explicit recovery.
     this.db.exec(
       "UPDATE tasks SET status='queued',nextRun=0 WHERE status='running'; UPDATE lectures SET status='interrupted' WHERE status IN ('recording','paused','importing'); UPDATE materials SET status='error',error='Import was interrupted. Retry to continue from the preserved original.' WHERE status='processing';",
@@ -62,19 +71,42 @@ export class Store {
   get root(): string {
     return this.settings().storageFolder || this.baseRoot;
   }
+  private schemaVersion(): number {
+    return Number((this.db.prepare('PRAGMA user_version').get() as Record<string, unknown>).user_version);
+  }
+  /**
+   * Sequential schema steps keyed by the version they produce. Each step runs in its own
+   * BEGIN IMMEDIATE transaction together with its `PRAGMA user_version` bump, so a crash
+   * leaves the library at the previous complete version. Append new steps at the end.
+   */
+  private readonly migrations: { to: number; run: (defaults: string) => void }[] = [
+    { to: 1, run: (defaults) => this.createSchemaV1(defaults) },
+    { to: 2, run: () => this.allowPermanentDeletionOfTrashedOriginals() },
+    { to: 3, run: () => this.addTranscriptItems() },
+  ];
   private migrate(): void {
-    const version = Number(
-      (this.db.prepare('PRAGMA user_version').get() as Record<string, unknown>).user_version,
-    );
-    if (version > 1) throw new Error('This library was created by a newer version of LectureDesk.');
+    const latest = this.migrations[this.migrations.length - 1].to; // currently 3
+    if (this.schemaVersion() > latest)
+      throw new Error('This library was created by a newer version of LectureDesk.');
     const defaults = JSON.stringify({ ...DEFAULT_SETTINGS, storageFolder: this.baseRoot });
-    if (version === 1) {
-      // Repair the missing singleton left by early builds without resetting any library records.
-      this.db.prepare('INSERT OR IGNORE INTO settings(id,data) VALUES(1,?)').run(defaults);
-      return;
+    for (const step of this.migrations) {
+      if (step.to <= this.schemaVersion()) continue;
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        step.run(defaults);
+        this.db.exec(`PRAGMA user_version=${step.to}`);
+        this.db.exec('COMMIT');
+      } catch (error) {
+        this.db.exec('ROLLBACK');
+        throw error;
+      }
     }
-    try {
-      this.db.exec(`BEGIN IMMEDIATE;
+    // Repair the missing singleton left by early builds without resetting any library records.
+    this.db.prepare('INSERT OR IGNORE INTO settings(id,data) VALUES(1,?)').run(defaults);
+  }
+  /** 0 → 1: initial schema. */
+  private createSchemaV1(defaults: string): void {
+    this.db.exec(`
       CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);
       CREATE TABLE subjects (id TEXT PRIMARY KEY,name TEXT NOT NULL,color TEXT NOT NULL,glossary TEXT NOT NULL,createdAt TEXT NOT NULL);
       CREATE TABLE lectures (id TEXT PRIMARY KEY,subjectId TEXT REFERENCES subjects(id) ON DELETE SET NULL,title TEXT NOT NULL,topic TEXT NOT NULL,date TEXT NOT NULL,tags TEXT NOT NULL,status TEXT NOT NULL,duration REAL NOT NULL,createdAt TEXT NOT NULL,deletedAt TEXT,activeVersionId TEXT);
@@ -91,12 +123,41 @@ export class Store {
       CREATE TABLE messages (id TEXT PRIMARY KEY,conversationId TEXT NOT NULL REFERENCES conversations(id),role TEXT NOT NULL,content TEXT NOT NULL,sources TEXT NOT NULL,createdAt TEXT NOT NULL);
       CREATE TABLE usage (id TEXT PRIMARY KEY,lectureId TEXT REFERENCES lectures(id),operation TEXT NOT NULL,model TEXT NOT NULL,data TEXT NOT NULL,createdAt TEXT NOT NULL);
       CREATE INDEX segments_order ON segments(lectureId,sequence); CREATE INDEX tasks_queue ON tasks(status,nextRun); CREATE INDEX materials_lecture ON materials(lectureId); CREATE INDEX versions_lecture ON versions(lectureId,createdAt);`);
-      this.db.prepare('INSERT INTO settings(id,data) VALUES(1,?)').run(defaults);
-      this.db.exec('PRAGMA user_version=1; COMMIT');
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
+    this.db.prepare('INSERT INTO settings(id,data) VALUES(1,?)').run(defaults);
+  }
+  /**
+   * 1 → 2: originals stay immutable, but permanently deleting a lecture that is already in
+   * Trash may remove its original. Updates remain forbidden unconditionally.
+   */
+  private allowPermanentDeletionOfTrashedOriginals(): void {
+    this.db.exec(`
+      DROP TRIGGER IF EXISTS original_delete;
+      CREATE TRIGGER original_delete BEFORE DELETE ON versions
+        WHEN OLD.kind='original' AND NOT EXISTS (SELECT 1 FROM lectures WHERE id=OLD.lectureId AND deletedAt IS NOT NULL)
+        BEGIN SELECT RAISE(ABORT,'Original transcripts are immutable'); END;`);
+  }
+  /**
+   * 2 → 3: finalized speech turns / silence-split chunks live in `transcript_items` (new recordings
+   * keep segments as audio only). Settings: the 'auto' lecture language is replaced by an explicit
+   * language that the user confirms once; the old default live model moves to the new default.
+   */
+  private addTranscriptItems(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS transcript_items (id TEXT PRIMARY KEY,lectureId TEXT NOT NULL REFERENCES lectures(id),start REAL NOT NULL,end REAL NOT NULL,text TEXT NOT NULL,status TEXT NOT NULL,source TEXT NOT NULL,model TEXT NOT NULL,language TEXT,error TEXT,sourceKey TEXT NOT NULL,createdAt TEXT NOT NULL,UNIQUE(lectureId,sourceKey));
+      CREATE INDEX IF NOT EXISTS transcript_items_order ON transcript_items(lectureId,start);`);
+    const row = this.db.prepare('SELECT data FROM settings WHERE id=1').get() as { data: string } | undefined;
+    if (!row) return; // The singleton is repaired with current defaults after migration.
+    const data = JSON.parse(row.data) as Record<string, unknown>;
+    const languages = ['ru', 'uk', 'en', 'pl'];
+    const ui = languages.includes(String(data.uiLanguage)) ? String(data.uiLanguage) : DEFAULT_SETTINGS.uiLanguage;
+    if (!('lectureLanguageConfirmed' in data)) {
+      const explicit = languages.includes(String(data.lectureLanguage));
+      data.lectureLanguageConfirmed = explicit && data.setupComplete === true;
+      if (!explicit) data.lectureLanguage = ui;
     }
+    // Only the untouched previous default is switched; any other explicit choice is preserved.
+    if (data.liveModel === 'gpt-live-transcribe') data.liveModel = DEFAULT_SETTINGS.liveModel;
+    this.db.prepare('UPDATE settings SET data=? WHERE id=1').run(JSON.stringify(data));
   }
   private rows<T>(table: string, where = '', values: (string | number | null)[] = [], order = ''): T[] {
     return this.db
@@ -134,7 +195,13 @@ export class Store {
   }
   settings(): Settings {
     const row = this.db.prepare('SELECT data FROM settings WHERE id=1').get() as { data: string };
-    return { ...DEFAULT_SETTINGS, ...JSON.parse(row.data) };
+    const settings: Settings = { ...DEFAULT_SETTINGS, ...JSON.parse(row.data) };
+    // 'auto' is no longer an effective lecture language; never let a stray value reach a request.
+    if (!['ru', 'uk', 'en', 'pl'].includes(settings.lectureLanguage)) {
+      settings.lectureLanguage = settings.uiLanguage;
+      settings.lectureLanguageConfirmed = false;
+    }
+    return settings;
   }
   saveSettings(patch: Partial<Settings>): Settings {
     // Explicitly pick known settings so credential-like or arbitrary IPC fields cannot enter backups.
@@ -183,7 +250,7 @@ export class Store {
       subjectId: input.subjectId || null,
       title: input.title?.trim() || 'Untitled lecture',
       topic: '',
-      date: now().slice(0, 10),
+      date: localIsoDate(new Date()),
       tags: [],
       status: 'ready',
       duration: 0,
@@ -200,6 +267,7 @@ export class Store {
     return {
       lecture,
       segments: this.rows<Segment>('segments', 'lectureId=?', [id], 'sequence'),
+      items: this.rows<TranscriptItem>('transcript_items', 'lectureId=?', [id], 'start,sourceKey'),
       versions: this.rows<Version>('versions', 'lectureId=?', [id], 'createdAt,id'),
       materials: this.rows<Material>('materials', 'lectureId=?', [id], 'createdAt'),
       gaps: this.rows<Gap>('gaps', 'lectureId=?', [id], 'at'),
@@ -226,6 +294,178 @@ export class Store {
   }
   lectureRestore(id: string): void {
     this.lectureSave({ id, deletedAt: null });
+  }
+  /** Permanently deletes one lecture that is already in Trash, including its original and files. */
+  lecturePurge(id: string): void {
+    const plan = this.scrubbed(() => this.transaction(() => this.purgeRows(id)));
+    this.removeLibraryFiles(plan);
+  }
+  /** Permanently deletes every lecture in Trash. Nothing is deleted if any of them is busy. */
+  trashEmpty(): { count: number } {
+    const plans = this.scrubbed(() =>
+      this.transaction(() => {
+        const trashed = this.rows<Lecture>('lectures', 'deletedAt IS NOT NULL');
+        for (const lecture of trashed) this.assertPurgeable(lecture);
+        return trashed.map((lecture) => this.purgeRows(lecture.id));
+      }),
+    );
+    this.removeLibraryFiles({
+      directories: plans.flatMap((plan) => plan.directories),
+      files: plans.flatMap((plan) => plan.files),
+    });
+    return { count: plans.length };
+  }
+  /** Overwrites freed database pages and flushes the WAL so deleted text does not linger on disk. */
+  private scrubbed<T>(operation: () => T): T {
+    const previous = Number(
+      (this.db.prepare('PRAGMA secure_delete').get() as Record<string, unknown>).secure_delete,
+    );
+    this.db.exec('PRAGMA secure_delete=ON');
+    try {
+      return operation();
+    } finally {
+      this.db.exec(`PRAGMA secure_delete=${previous ? 'ON' : 'OFF'}`);
+      try {
+        this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+      } catch {
+        /* A busy checkpoint is retried automatically by SQLite later. */
+      }
+    }
+  }
+  private assertPurgeable(lecture: Lecture): void {
+    if (!lecture.deletedAt) throw new Error('Only lectures in Trash can be deleted permanently');
+    if (['recording', 'paused', 'importing'].includes(lecture.status))
+      throw new Error('Wait for recording or import to finish before deleting this lecture permanently');
+    if (this.rows<Material>('materials', "lectureId=? AND status='processing'", [lecture.id]).length)
+      throw new Error('Wait for file processing to finish before deleting this lecture permanently');
+  }
+  /** Deletes the lecture's rows (caller owns the transaction) and returns the files to remove afterwards. */
+  private purgeRows(id: string): { directories: string[]; files: string[] } {
+    const lecture = this.rows<Lecture>('lectures', 'id=?', [id])[0];
+    if (!lecture) throw new Error('Lecture does not exist');
+    this.assertPurgeable(lecture);
+    const segments = this.rows<Segment>('segments', 'lectureId=?', [id]);
+    const materials = this.rows<Material>('materials', 'lectureId=?', [id]);
+    // versions.sourceVersionId links versions of this lecture to each other in arbitrary order;
+    // foreign keys are enforced (PRAGMA foreign_keys=ON), so check them at COMMIT once all are gone.
+    this.db.exec('PRAGMA defer_foreign_keys=ON');
+    const run = (sql: string) => this.db.prepare(sql).run(id);
+    run('DELETE FROM tasks WHERE lectureId=?');
+    run('DELETE FROM usage WHERE lectureId=?');
+    run('DELETE FROM gaps WHERE lectureId=?');
+    run('DELETE FROM transcript_items WHERE lectureId=?');
+    run('DELETE FROM segments WHERE lectureId=?');
+    run('UPDATE lectures SET activeVersionId=NULL WHERE id=?');
+    // The original_delete trigger permits this only because the lecture row is still marked deleted.
+    run('DELETE FROM versions WHERE lectureId=?');
+    run('DELETE FROM materials WHERE lectureId=?');
+    this.forgetRetrieval([`lecture:${id}`, ...materials.map((material) => `material:${material.id}`)]);
+    run('DELETE FROM lectures WHERE id=?');
+    return {
+      directories: [path.join('audio', id), path.join('lectures', id)],
+      files: [...segments, ...materials].map((item) => item.path).filter(Boolean),
+    };
+  }
+  /** Removes chat retrieval passages (tables owned by LocalRetrieval in ai-retrieval.ts), if indexed. */
+  private forgetRetrieval(sourceKeys: string[]): void {
+    const tables = new Set(
+      (
+        this.db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE name IN ('ai_passage_fts','ai_passages','ai_index_sources')",
+          )
+          .all() as { name: string }[]
+      ).map((row) => row.name),
+    );
+    for (const key of sourceKeys) {
+      if (tables.has('ai_passage_fts') && tables.has('ai_passages'))
+        this.db
+          .prepare('DELETE FROM ai_passage_fts WHERE id IN (SELECT id FROM ai_passages WHERE sourceKey=?)')
+          .run(key);
+      if (tables.has('ai_passages')) this.db.prepare('DELETE FROM ai_passages WHERE sourceKey=?').run(key);
+      if (tables.has('ai_index_sources'))
+        this.db.prepare('DELETE FROM ai_index_sources WHERE sourceKey=?').run(key);
+    }
+  }
+  /**
+   * Best-effort removal of purged library files. Only paths inside a content folder of `root`
+   * are touched; links are never followed and files still referenced by other rows are kept.
+   */
+  private removeLibraryFiles(plan: { directories: string[]; files: string[] }): void {
+    const root = path.resolve(this.root);
+    let realRoot: string;
+    try {
+      realRoot = realpathSync(root);
+    } catch {
+      return;
+    }
+    const outside = (rel: string) =>
+      !rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel);
+    const contained = (target: string): string | null => {
+      const resolved = path.resolve(root, target);
+      const rel = path.relative(root, resolved);
+      if (outside(rel)) return null;
+      const parts = rel.split(path.sep);
+      if (parts.length < 2 || !LIBRARY_CONTENT.includes(parts[0])) return null;
+      try {
+        // Every existing parent must physically live inside the library (no junction/symlink escape).
+        const parent = realpathSync(path.dirname(resolved));
+        if (parent !== realRoot && outside(path.relative(realRoot, parent))) return null;
+        if (lstatSync(resolved).isSymbolicLink()) return null;
+      } catch {
+        return null; // Missing: nothing to delete.
+      }
+      return resolved;
+    };
+    // Paths still referenced by remaining rows (e.g. a file shared after an import) are never removed.
+    const key = (value: string) => (process.platform === 'win32' ? value.toLowerCase() : value);
+    const referenced = new Set(
+      (
+        this.db
+          .prepare("SELECT path FROM segments WHERE path<>'' UNION SELECT path FROM materials WHERE path<>''")
+          .all() as { path: string }[]
+      ).map((row) => key(path.resolve(root, row.path))),
+    );
+    const stillUsed = (target: string, directory: boolean) => {
+      if (referenced.has(key(target))) return true;
+      if (!directory) return false;
+      const prefix = key(target + path.sep);
+      for (const file of referenced) if (file.startsWith(prefix)) return true;
+      return false;
+    };
+    for (const directory of plan.directories) {
+      const target = contained(directory);
+      if (!target || stillUsed(target, true)) continue;
+      try {
+        if (lstatSync(target).isDirectory())
+          rmSync(target, { recursive: true, force: true, maxRetries: 2, retryDelay: 50 });
+      } catch (error) {
+        console.warn('LectureDesk: could not remove purged folder', target, error);
+      }
+    }
+    for (const file of plan.files) {
+      const target = contained(file);
+      if (!target || stillUsed(target, false)) continue;
+      try {
+        if (lstatSync(target).isDirectory()) continue;
+        unlinkSync(target);
+      } catch (error) {
+        console.warn('LectureDesk: could not remove purged file', target, error);
+        continue;
+      }
+      // Drop folders left empty (e.g. materials/<id>, restored/<backup>/files/…) up to the content folder.
+      for (
+        let folder = path.dirname(target);
+        path.relative(root, folder).split(path.sep).length >= 2 && !outside(path.relative(root, folder));
+        folder = path.dirname(folder)
+      ) {
+        try {
+          rmdirSync(folder);
+        } catch {
+          break;
+        }
+      }
+    }
   }
   versionSave(input: {
     lectureId: string;
@@ -280,6 +520,36 @@ export class Store {
   segmentUpdate(id: string, patch: Partial<Segment>): void {
     this.update('segments', id, patch, ['text', 'status', 'error']);
   }
+  /** Idempotent by (lectureId, sourceKey): a repeated save returns the row stored first. */
+  itemSave(input: Omit<TranscriptItem, 'id' | 'createdAt'> & { id?: string; createdAt?: string }): TranscriptItem {
+    const item: TranscriptItem = {
+      id: input.id ?? randomUUID(),
+      lectureId: input.lectureId,
+      start: input.start,
+      end: Math.max(input.start, input.end),
+      text: input.text,
+      status: input.status,
+      source: input.source,
+      model: input.model,
+      language: input.language ?? null,
+      error: input.error ?? null,
+      sourceKey: input.sourceKey,
+      createdAt: input.createdAt ?? now(),
+    };
+    const entries = Object.entries(item);
+    this.db
+      .prepare(
+        `INSERT INTO transcript_items (${entries.map(([key]) => key).join(',')}) VALUES (${entries.map(() => '?').join(',')}) ON CONFLICT(lectureId,sourceKey) DO NOTHING`,
+      )
+      .run(...entries.map(([key, value]) => encode(key, value)));
+    return this.rows<TranscriptItem>('transcript_items', 'lectureId=? AND sourceKey=?', [
+      item.lectureId,
+      item.sourceKey,
+    ])[0];
+  }
+  itemUpdate(id: string, patch: Partial<Pick<TranscriptItem, 'text' | 'status' | 'error' | 'language'>>): void {
+    this.update('transcript_items', id, patch, ['text', 'status', 'error', 'language']);
+  }
   gap(lectureId: string, at: number, reason: string): Gap {
     const gap = { id: randomUUID(), lectureId, at, reason, createdAt: now() };
     this.insert('gaps', gap);
@@ -325,6 +595,9 @@ export class Store {
   }
   tasks(): Task[] {
     return this.rows<Task>('tasks', '', [], 'createdAt');
+  }
+  taskGet(id: string): Task | undefined {
+    return this.rows<Task>('tasks', 'id=?', [id])[0];
   }
   materialSave(material: Material): Material {
     this.insert('materials', material);

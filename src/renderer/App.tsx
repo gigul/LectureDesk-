@@ -75,6 +75,8 @@ import { AudioCapture } from './audio/recorder';
 import { Button, Empty, Field, IconButton, Languages, Markdown, Modal, Select, Toggle } from './components';
 import type { T } from './components';
 import { languageNames, locale, size, time, translator, type TextKey } from './i18n';
+import { autoLectureTitle } from '../shared/naming';
+import { renderTranscript, segmentAt, transcriptUnits, turnPolicy } from '../shared/transcript';
 
 type Catalog = { live: string[]; file: string[]; text: string[]; available: string[]; verified: boolean };
 type Scope = 'all' | 'unfiled' | 'trash' | string;
@@ -119,6 +121,7 @@ function versionLabel(kind: Version['kind'], t: T) {
 function taskLabel(kind: string, t: T) {
   const labels: Record<string, TextKey> = {
     transcribe: 'original',
+    'transcribe-range': 'original',
     improve: 'improve',
     action: 'quickActions',
     translation: 'translation',
@@ -166,12 +169,17 @@ export default function App() {
   const [subjectMenu, setSubjectMenu] = useState<string | null>(null);
   const [lectureMenu, setLectureMenu] = useState(false);
   const [deleteSubject, setDeleteSubject] = useState<Subject | null>(null);
+  const [clearTrashOpen, setClearTrashOpen] = useState(false);
+  const [clearingTrash, setClearingTrash] = useState(false);
   const [editing, setEditing] = useState(false);
   const [editContent, setEditContent] = useState('');
   const [selectedText, setSelectedText] = useState('');
   const [notices, setNotices] = useState<Notice[]>([]);
   const [busy, setBusy] = useState(false);
-  const [partial, setPartial] = useState<Record<string, string>>({});
+  const [partial, setPartial] = useState<Record<string, { text: string; start?: number }>>({});
+  // Action waiting for the one-time lecture language confirmation (recording or import).
+  const [languagePrompt, setLanguagePrompt] = useState<null | (() => void)>(null);
+  const languageChosen = useRef(false);
   const [online, setOnline] = useState(navigator.onLine);
   const [drag, setDrag] = useState(false);
   const [importProgress, setImportProgress] = useState<number | null>(null);
@@ -239,7 +247,7 @@ export default function App() {
     let timer: number | undefined;
     const off = window.lecturedesk.on((event: AppEvent) => {
       if (event.type === 'partial' && event.lectureId)
-        setPartial((p) => ({ ...p, [event.lectureId!]: event.text || '' }));
+        setPartial((p) => ({ ...p, [event.lectureId!]: { text: event.text || '', start: event.start } }));
       if (event.type === 'error') notify(event.message || 'Unknown error', 'error');
       if (event.type === 'recording-gap') {
         notify(event.message || translator(DEFAULT_SETTINGS.uiLanguage)('gap'), 'error');
@@ -335,6 +343,7 @@ export default function App() {
               d.lecture.topic,
               ...d.lecture.tags,
               ...d.segments.map((s) => s.text),
+              ...(d.items || []).filter((item) => item.status === 'done').map((item) => item.text),
               ...d.versions.map((v) => v.content),
               ...d.materials.flatMap((m) => [m.name, ...m.pages.map((p) => p.text)]),
             ]
@@ -360,13 +369,13 @@ export default function App() {
     detail?.versions.find((v) => v.id === versionId) ||
     detail?.versions.find((v) => v.id === detail.lecture.activeVersionId) ||
     detail?.versions[0];
+  // Accepted text plus language-rejected items (shown only as warning rows, never as transcript).
+  const units = useMemo(
+    () => (detail ? transcriptUnits(detail.segments, detail.items || [], { includeRejected: true }) : []),
+    [detail],
+  );
   const sourceTranscript =
-    detail?.versions.find((v) => v.kind === 'original')?.content ||
-    detail?.segments
-      .filter((s) => s.text)
-      .map((s) => s.text)
-      .join('\n\n') ||
-    '';
+    detail?.versions.find((v) => v.kind === 'original')?.content || renderTranscript(units) || '';
   const visibleLectures = useMemo(() => {
     let list = (snapshot?.lectures || []).filter((l) =>
       scope === 'trash'
@@ -403,8 +412,43 @@ export default function App() {
   );
   const allTags = Array.from(new Set((snapshot?.lectures || []).flatMap((l) => l.tags))).sort();
   const tasks = (snapshot?.tasks || []).filter((task) => !['done', 'cancelled'].includes(task.status));
+  const trashedLectures = (snapshot?.lectures || []).filter((l) => l.deletedAt);
+  // Permanent deletion waits for capture and imports that still write into a trashed lecture.
+  const trashBusy =
+    trashedLectures.some(
+      (l) => l.id === recordId || ['recording', 'paused', 'importing'].includes(l.status),
+    ) ||
+    (snapshot?.materials || []).some(
+      (m) => m.status === 'processing' && trashedLectures.some((l) => l.id === m.lectureId),
+    );
+  async function clearTrash() {
+    const trashed = new Set(trashedLectures.map((l) => l.id));
+    if (selectedRef.current && trashed.has(selectedRef.current)) {
+      // Release the audio file of a trashed lecture before its folder is deleted.
+      playerRef.current?.pause();
+      setPlayerUrl('');
+    }
+    setClearingTrash(true);
+    const result = await perform(() => call<{ count: number }>('trash.empty'));
+    setClearingTrash(false);
+    if (!result) return;
+    setClearTrashOpen(false);
+    if (selectedRef.current && trashed.has(selectedRef.current)) {
+      selectedRef.current = null;
+      setSelected(null);
+    }
+    await refresh().catch((e) => notify(String(e), 'error'));
+    notify(t('clearTrashDone').replace('{count}', String(result.count)));
+  }
+  /** Recording and import transcribe in the lecture language, so it must be chosen explicitly once. */
+  function languageConfirmed(action: () => void) {
+    if (!settings.setupComplete || settings.lectureLanguageConfirmed || languageChosen.current) return true;
+    setLanguagePrompt(() => action);
+    return false;
+  }
   async function startRecording() {
     if (recordId || capture.current) return;
+    if (!languageConfirmed(() => void startRecording())) return;
     setBusy(true);
     let id: string | undefined;
     const engine = new AudioCapture();
@@ -413,7 +457,12 @@ export default function App() {
       await engine.prepare(settings.audioMode, settings.microphoneId);
       const lecture = await call<Lecture>('lecture.create', {
         subjectId: currentSubject?.id || null,
-        title: t('untitled'),
+        // "География 14.10.26", or "География 14.10.26 (2)" when that name is already taken.
+        title: autoLectureTitle(
+          currentSubject?.name || t('autoLectureName'),
+          new Date(),
+          (snapshot?.lectures || []).filter((l) => !l.deletedAt).map((l) => l.title),
+        ),
       });
       id = lecture.id;
       await call('record.start', { lectureId: id, mode: settings.audioMode });
@@ -470,7 +519,7 @@ export default function App() {
       setRecordId(null);
       capture.current = null;
       setLevel(0);
-      setPartial((p) => ({ ...p, [recordId]: '' }));
+      setPartial((p) => ({ ...p, [recordId]: { text: '' } }));
       await refresh();
       return true;
     }, t('stopped'));
@@ -478,6 +527,7 @@ export default function App() {
     setBusy(false);
   }
   async function importFiles(paths?: string[]) {
+    if (!languageConfirmed(() => void importFiles(paths))) return;
     await perform(async () => {
       if (paths)
         await call('import.paths', {
@@ -502,6 +552,17 @@ export default function App() {
         void playerRef.current.play().catch((e) => notify(String(e), 'error'));
       } else setPlayerUrl(result.url);
     }
+  }
+  /** Plays the lecture audio from a lecture time, whichever saved file contains it. */
+  function seekTo(seconds: number) {
+    if (!detail) return;
+    const target = segmentAt(detail.segments, seconds);
+    if (!target) return;
+    if (target.segment.id === playerSegment && playerRef.current) {
+      setPlayerTime(target.offset);
+      playerRef.current.currentTime = target.offset;
+      if (playerRef.current.paused) void playerRef.current.play().catch((e) => notify(String(e), 'error'));
+    } else void playSegment(target.segment.id, target.offset);
   }
   async function runAction(
     action: string,
@@ -842,10 +903,23 @@ export default function App() {
         )}
         <div className="library-heading">
           <div>
-            <h1>
-              {currentSubject?.name ||
-                t(scope === 'trash' ? 'trash' : scope === 'unfiled' ? 'unfiled' : 'allLectures')}
-            </h1>
+            <div className="library-title-row">
+              <h1>
+                {currentSubject?.name ||
+                  t(scope === 'trash' ? 'trash' : scope === 'unfiled' ? 'unfiled' : 'allLectures')}
+              </h1>
+              {scope === 'trash' && trashedLectures.length > 0 && (
+                <Button
+                  variant="danger"
+                  icon={Trash2}
+                  disabled={trashBusy || clearingTrash}
+                  title={trashBusy ? t('clearTrashBlocked') : undefined}
+                  onClick={() => setClearTrashOpen(true)}
+                >
+                  {t('clearTrash')}
+                </Button>
+              )}
+            </div>
             <p>
               {visibleLectures.length} {t('lectures')}
               {currentSubject?.glossary && (
@@ -1222,7 +1296,7 @@ export default function App() {
                         />
                       ) : pane === 'original' ? (
                         <>
-                          {!sourceTranscript && !detail.segments.some((s) => s.text) ? (
+                          {!sourceTranscript && !units.length ? (
                             <Empty
                               icon={Headphones}
                               title={t('noTranscript')}
@@ -1231,34 +1305,57 @@ export default function App() {
                             />
                           ) : (
                             <div className="transcript document-body">
-                              {detail.segments.some((s) => s.text) ? (
-                                detail.segments
-                                  .filter((s) => s.text)
-                                  .map((segment) => (
-                                    <div className="transcript-segment" key={segment.id}>
+                              {units.length ? (
+                                units.map((unit) =>
+                                  unit.status === 'rejected' ? (
+                                    <div className="transcript-segment rejected" key={unit.id}>
                                       <button
                                         className="timestamp"
-                                        onClick={() => void playSegment(segment.id)}
+                                        onClick={() => seekTo(unit.start)}
                                         title={t('segmentTiming')}
                                       >
                                         <Play size={11} />
-                                        {time(segment.start)}
+                                        {time(unit.start)}
                                       </button>
-                                      <p>{segment.text}</p>
+                                      <div className="rejected-body">
+                                        <p className="rejected-note">
+                                          <AlertTriangle size={13} />
+                                          {t('languageRejected')}
+                                        </p>
+                                        <details>
+                                          <summary>{t('languageRejectedRaw')}</summary>
+                                          <p>{unit.text}</p>
+                                        </details>
+                                      </div>
                                     </div>
-                                  ))
+                                  ) : (
+                                    <div className="transcript-segment" key={unit.id}>
+                                      <button
+                                        className="timestamp"
+                                        onClick={() => seekTo(unit.start)}
+                                        title={t('segmentTiming')}
+                                      >
+                                        <Play size={11} />
+                                        {time(unit.start)}
+                                      </button>
+                                      <p>{unit.text}</p>
+                                    </div>
+                                  ),
+                                )
                               ) : (
                                 <Markdown text={sourceTranscript} />
                               )}
                             </div>
                           )}
-                          {partial[detail.lecture.id] && (
+                          {partial[detail.lecture.id]?.text && (
                             <div className="partial-text">
                               <span className="live-label">
                                 <LoaderCircle size={13} className="spin" />
                                 {t('liveText')}
+                                {partial[detail.lecture.id].start !== undefined &&
+                                  ` · ${time(partial[detail.lecture.id].start!)}`}
                               </span>
-                              <p>{partial[detail.lecture.id]}</p>
+                              <p>{partial[detail.lecture.id].text}</p>
                             </div>
                           )}
                           {detail.gaps.map((gap) => (
@@ -1486,18 +1583,7 @@ export default function App() {
                           value={
                             (detail.segments.find((s) => s.id === playerSegment)?.start || 0) + playerTime
                           }
-                          onChange={(e) => {
-                            const value = Number(e.target.value);
-                            const segment =
-                              detail.segments.find((s) => value >= s.start && value < s.end) ||
-                              detail.segments.at(-1);
-                            if (!segment) return;
-                            const offset = Math.max(0, value - segment.start);
-                            if (segment.id === playerSegment && playerRef.current) {
-                              setPlayerTime(offset);
-                              playerRef.current.currentTime = offset;
-                            } else void playSegment(segment.id, offset);
-                          }}
+                          onChange={(e) => seekTo(Number(e.target.value))}
                         />
                         <span className="player-time">{time(detail.lecture.duration)}</span>
                         <Select
@@ -1628,6 +1714,25 @@ export default function App() {
       {!settings.setupComplete && (
         <Onboarding settings={settings} hasKey={snapshot.hasKey} t={t} perform={perform} onDone={refresh} />
       )}
+      {languagePrompt && (
+        <LectureLanguagePrompt
+          settings={settings}
+          t={t}
+          onClose={() => setLanguagePrompt(null)}
+          onConfirm={async (language) => {
+            const next = languagePrompt;
+            const saved = await perform(async () => {
+              await call('settings.save', { lectureLanguage: language, lectureLanguageConfirmed: true });
+              return true;
+            });
+            if (!saved) return;
+            languageChosen.current = true;
+            setLanguagePrompt(null);
+            await refresh().catch((e) => notify(String(e), 'error'));
+            next();
+          }}
+        />
+      )}
       {modal === 'settings' && (
         <SettingsDialog
           settings={settings}
@@ -1730,6 +1835,37 @@ export default function App() {
           }
         >
           <p>{t('deleteSubjectBody')}</p>
+        </Modal>
+      )}
+      {clearTrashOpen && (
+        <Modal
+          title={t('clearTrashConfirmTitle')}
+          t={t}
+          onClose={() => {
+            if (!clearingTrash) setClearTrashOpen(false);
+          }}
+          footer={
+            <>
+              <Button disabled={clearingTrash} onClick={() => setClearTrashOpen(false)}>
+                {t('cancel')}
+              </Button>
+              <Button
+                variant="danger"
+                icon={Trash2}
+                busy={clearingTrash}
+                disabled={trashBusy || !trashedLectures.length}
+                onClick={() => void clearTrash()}
+              >
+                {t('clearTrashConfirm')}
+              </Button>
+            </>
+          }
+        >
+          <div className="notice-box danger" role="alert">
+            <AlertTriangle size={21} />
+            <p>{t('clearTrashConfirmBody').replace('{count}', String(trashedLectures.length))}</p>
+          </div>
+          {trashBusy && <p className="muted">{t('clearTrashBlocked')}</p>}
         </Modal>
       )}
       {modal === 'shortcuts' && (
@@ -2193,7 +2329,15 @@ function ApiControls({
         <p className="muted small">{t('modelHint')}</p>
         <div className="form-grid">
           {fields.map(({ key: field, group }) => (
-            <Field key={field} label={t(field)}>
+            <Field
+              key={field}
+              label={t(field)}
+              hint={
+                field === 'liveModel'
+                  ? t(turnPolicy(settings.liveModel) === 'server' ? 'liveModeServer' : 'liveModeLocal')
+                  : undefined
+              }
+            >
               <Select value={settings[field]} onChange={(e) => onChange({ [field]: e.target.value })}>
                 {Array.from(new Set([settings[field], ...catalog[group]])).map((model) => (
                   <option key={model} value={model}>
@@ -2303,7 +2447,7 @@ function Onboarding({
   async function finish() {
     setBusy(true);
     await perform(async () => {
-      await call('settings.save', { ...draft, setupComplete: true });
+      await call('settings.save', { ...draft, setupComplete: true, lectureLanguageConfirmed: true });
       if (name.trim()) await call('subject.save', { name: name.trim(), color: '#52917b', glossary: '' });
       await onDone();
     });
@@ -2346,12 +2490,11 @@ function Onboarding({
                     onChange={(v) => v !== 'auto' && update({ uiLanguage: v })}
                   />
                 </Field>
-                <Field label={t('lectureLanguage')}>
+                <Field label={t('lectureLanguage')} hint={t('lectureLanguageHint')}>
                   <Languages
                     value={draft.lectureLanguage}
-                    auto
                     t={t}
-                    onChange={(v) => update({ lectureLanguage: v })}
+                    onChange={(v) => v !== 'auto' && update({ lectureLanguage: v })}
                   />
                 </Field>
                 <Field label={t('targetLanguage')}>
@@ -2409,6 +2552,51 @@ function Onboarding({
         </section>
       </div>
     </div>
+  );
+}
+/** One-time choice before the first recording/import after 'auto' detection was removed. */
+function LectureLanguagePrompt({
+  settings,
+  t,
+  onClose,
+  onConfirm,
+}: {
+  settings: Settings;
+  t: T;
+  onClose: () => void;
+  onConfirm: (language: Language) => Promise<void>;
+}) {
+  const [language, setLanguage] = useState<Language>(settings.lectureLanguage);
+  const [busy, setBusy] = useState(false);
+  return (
+    <Modal
+      title={t('lectureLanguagePromptTitle')}
+      onClose={onClose}
+      t={t}
+      footer={
+        <>
+          <Button onClick={onClose} disabled={busy}>
+            {t('cancel')}
+          </Button>
+          <Button
+            variant="primary"
+            icon={Check}
+            busy={busy}
+            onClick={() => {
+              setBusy(true);
+              void onConfirm(language).finally(() => setBusy(false));
+            }}
+          >
+            {t('confirmLanguage')}
+          </Button>
+        </>
+      }
+    >
+      <p className="muted">{t('lectureLanguagePromptBody')}</p>
+      <Field label={t('lectureLanguage')}>
+        <Languages value={language} t={t} onChange={(v) => v !== 'auto' && setLanguage(v)} />
+      </Field>
+    </Modal>
   );
 }
 function LiveSettings({
@@ -2528,7 +2716,8 @@ function SettingsDialog({
         setTranslationChange(draft.outputLanguage);
         return;
       }
-      await call('settings.save', draft);
+      // Saving settings confirms the lecture language shown in them.
+      await call('settings.save', { ...draft, lectureLanguageConfirmed: true });
       await onSave();
       onClose();
     }, t('saved'));
@@ -2577,12 +2766,11 @@ function SettingsDialog({
                   onChange={(v) => v !== 'auto' && update({ uiLanguage: v })}
                 />
               </Field>
-              <Field label={t('lectureLanguage')}>
+              <Field label={t('lectureLanguage')} hint={t('lectureLanguageHint')}>
                 <Languages
                   value={draft.lectureLanguage}
-                  auto
                   t={t}
-                  onChange={(v) => update({ lectureLanguage: v })}
+                  onChange={(v) => v !== 'auto' && update({ lectureLanguage: v })}
                 />
               </Field>
               <Field label={t('targetLanguage')}>
@@ -3236,6 +3424,121 @@ function ExportDialog({
   );
 }
 
+// Resizable chat panel. Widths mirror styles.css: `.sidebar` is 220px and the main area keeps at
+// least 420px (lecture list + a readable document column). Without a stored preference narrow
+// windows (≤1200px, e.g. laptops with 125–150% scaling) start from the compact 310px width.
+const CHAT_WIDTH_KEY = 'lecturedesk.chatWidth';
+const CHAT_DEFAULT_WIDTH = 345;
+const CHAT_COMPACT_WIDTH = 310;
+const CHAT_COMPACT_VIEWPORT = 1200;
+const CHAT_MIN_WIDTH = 300;
+const CHAT_MAX_WIDTH = 900;
+const SIDEBAR_WIDTH = 220;
+const MAIN_MIN_WIDTH = 420;
+const CHAT_KEY_STEP = 16;
+const chatMaxWidth = (viewport: number) =>
+  Math.max(CHAT_MIN_WIDTH, Math.min(CHAT_MAX_WIDTH, viewport - SIDEBAR_WIDTH - MAIN_MIN_WIDTH));
+const clampChatWidth = (width: number, viewport: number) =>
+  Math.round(Math.min(chatMaxWidth(viewport), Math.max(CHAT_MIN_WIDTH, width)));
+const defaultChatWidth = (viewport: number) =>
+  viewport <= CHAT_COMPACT_VIEWPORT ? CHAT_COMPACT_WIDTH : CHAT_DEFAULT_WIDTH;
+function readChatWidth(): number | null {
+  try {
+    const value = Number(window.localStorage.getItem(CHAT_WIDTH_KEY));
+    return Number.isFinite(value) && value > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+function saveChatWidth(width: number | null) {
+  try {
+    if (width === null) window.localStorage.removeItem(CHAT_WIDTH_KEY);
+    else window.localStorage.setItem(CHAT_WIDTH_KEY, String(Math.round(width)));
+  } catch {
+    /* A per-device convenience: the default width is used when storage is unavailable. */
+  }
+}
+/** Chat width preference: the stored value survives a temporarily smaller window and is re-clamped on resize. */
+function useChatWidth() {
+  const [preferred, setPreferred] = useState<number | null>(readChatWidth);
+  const [viewport, setViewport] = useState(() => window.innerWidth);
+  useEffect(() => {
+    const update = () => setViewport(window.innerWidth);
+    window.addEventListener('resize', update);
+    return () => window.removeEventListener('resize', update);
+  }, []);
+  return {
+    width: clampChatWidth(preferred ?? defaultChatWidth(viewport), viewport),
+    max: chatMaxWidth(viewport),
+    reset: () => {
+      setPreferred(null);
+      saveChatWidth(null);
+    },
+    preview: (next: number) => setPreferred(clampChatWidth(next, window.innerWidth)),
+    commit: (next: number) => {
+      const value = clampChatWidth(next, window.innerWidth);
+      setPreferred(value);
+      saveChatWidth(value);
+    },
+  };
+}
+function ChatResizeHandle({ width, max, preview, commit, reset, t }: ReturnType<typeof useChatWidth> & { t: T }) {
+  const [dragging, setDragging] = useState(false);
+  const drag = useRef<{ pointerId: number; startX: number; startWidth: number; last: number } | null>(null);
+  useEffect(() => {
+    if (!dragging) return;
+    document.body.classList.add('chat-resizing');
+    return () => document.body.classList.remove('chat-resizing');
+  }, [dragging]);
+  const finish = (event: React.PointerEvent<HTMLDivElement>) => {
+    const current = drag.current;
+    if (!current || current.pointerId !== event.pointerId) return;
+    drag.current = null;
+    setDragging(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId))
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    commit(current.last);
+  };
+  return (
+    <div
+      className={`chat-resize-handle ${dragging ? 'dragging' : ''}`}
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={t('resizeChat')}
+      aria-valuenow={width}
+      aria-valuemin={CHAT_MIN_WIDTH}
+      aria-valuemax={max}
+      aria-valuetext={`${width}px`}
+      title={t('resizeChatHint')}
+      tabIndex={0}
+      onPointerDown={(event) => {
+        if (event.button !== 0) return;
+        event.preventDefault(); // No text selection while dragging.
+        event.currentTarget.setPointerCapture(event.pointerId);
+        drag.current = { pointerId: event.pointerId, startX: event.clientX, startWidth: width, last: width };
+        setDragging(true);
+      }}
+      onPointerMove={(event) => {
+        const current = drag.current;
+        if (!current || current.pointerId !== event.pointerId) return;
+        // The handle sits on the panel's left edge: moving left widens the panel.
+        current.last = clampChatWidth(current.startWidth + current.startX - event.clientX, window.innerWidth);
+        preview(current.last);
+      }}
+      onPointerUp={finish}
+      onPointerCancel={finish}
+      onLostPointerCapture={finish}
+      onDoubleClick={reset}
+      onKeyDown={(event) => {
+        const step =
+          event.key === 'ArrowLeft' ? CHAT_KEY_STEP : event.key === 'ArrowRight' ? -CHAT_KEY_STEP : 0;
+        if (!step) return;
+        event.preventDefault();
+        commit(width + step);
+      }}
+    />
+  );
+}
 function ChatPanel({
   seed,
   snapshot,
@@ -3272,6 +3575,7 @@ function ChatPanel({
   const [busy, setBusy] = useState(false);
   const [history, setHistory] = useState(false);
   const [contextOpen, setContextOpen] = useState(true);
+  const chatWidth = useChatWidth();
   const end = useRef<HTMLDivElement>(null);
   useEffect(() => {
     void perform(async () => setConversations(await call<Conversation[]>('chat.list')));
@@ -3377,7 +3681,8 @@ function ChatPanel({
     setBusy(false);
   }
   return (
-    <aside className="chat-panel">
+    <aside className="chat-panel" style={{ '--chat-width': `${chatWidth.width}px` } as React.CSSProperties}>
+      <ChatResizeHandle {...chatWidth} t={t} />
       <header className="chat-header">
         <span className="chat-brand-icon">
           <Sparkles size={18} />
@@ -3581,6 +3886,15 @@ function ChatPanel({
                       {message.sources.map((source, i) => (
                         <button
                           key={i}
+                          // Sources of lectures deleted permanently from Trash can no longer be opened.
+                          disabled={
+                            !source.url &&
+                            ((!!source.lectureId &&
+                              !snapshot.lectures.some((l) => l.id === source.lectureId)) ||
+                              (!source.lectureId &&
+                                !!source.materialId &&
+                                !(snapshot.materials || []).some((m) => m.id === source.materialId)))
+                          }
                           onClick={() => {
                             if (source.url) void perform(() => call('shell.url', { url: source.url }));
                             else if (source.lectureId) onLecture(source.lectureId);
